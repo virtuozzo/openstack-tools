@@ -137,7 +137,12 @@ def _connect_scoped_to_project(
 
     domain_id = project_domain_id or fallback_domain_id
     domain_name = project_domain_name or fallback_domain_name
-    env_keys = ("OS_PROJECT_ID", "OS_PROJECT_NAME", "OS_PROJECT_DOMAIN_ID", "OS_PROJECT_DOMAIN_NAME")
+    env_keys = (
+        "OS_PROJECT_ID",
+        "OS_PROJECT_NAME",
+        "OS_PROJECT_DOMAIN_ID",
+        "OS_PROJECT_DOMAIN_NAME",
+    )
     saved = {k: os.environ.get(k) for k in env_keys}
     try:
         os.environ["OS_PROJECT_ID"] = project_id
@@ -169,7 +174,7 @@ def _fetch_quota_worker(
     """
     Fetch quota usage for one project; runs in a separate process.
     If env_snapshot is provided (e.g. on Windows spawn), set env from it so auth works.
-    Otherwise the process uses inherited env (fork). Uses same env-based connection as sequential mode.
+    Otherwise the process uses inherited env (fork).
     Returns (name, pid, usage).
     """
     if env_snapshot:
@@ -189,8 +194,12 @@ def _fetch_quota_worker(
         return (name, pid, ZERO_QUOTA_USAGE.copy())
 
 
-def _project_scope_args(project, fallback_domain_id: str | None, fallback_domain_name: str | None):
-    """(name, project_id, project_domain_id, project_domain_name, fallback_domain_id, fallback_domain_name)."""
+def _project_scope_args(
+    project,
+    fallback_domain_id: str | None,
+    fallback_domain_name: str | None,
+):
+    """Build the tuple used to create a project-scoped quota connection."""
     return (
         (project.name or "unknown").strip(),
         project.id,
@@ -206,7 +215,7 @@ def _fetch_quota_worker_unpack(args: tuple) -> tuple[str, str, dict]:
     return _fetch_quota_worker(*args)
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Sum OpenStack quota usage (cores, ram, storage) across projects in a domain.",
     )
@@ -222,23 +231,36 @@ def main() -> None:
         type=float,
         default=None,
         metavar="GiB",
-        help="Domain limit for RAM in GiB; free = limit - total usage. Also from OS_QUOTA_LIMIT_RAM.",
+        help=(
+            "Domain limit for RAM in GiB; free = limit - total usage. "
+            "Also from OS_QUOTA_LIMIT_RAM."
+        ),
     )
     parser.add_argument(
         "--limit-storage",
         type=float,
         default=None,
         metavar="TiB",
-        help="Domain limit for storage in TiB; free = limit - total usage. Also from OS_QUOTA_LIMIT_STORAGE.",
+        help=(
+            "Domain limit for storage in TiB; free = limit - total usage. "
+            "Also from OS_QUOTA_LIMIT_STORAGE."
+        ),
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=8,
         metavar="N",
-        help="Number of parallel workers to fetch project quotas (default: 8). Use 1 for sequential.",
+        help=(
+            "Number of parallel workers to fetch project quotas (default: 8). "
+            "Use 1 for sequential."
+        ),
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
 
     _apply_quota_limits_from_env(args)
 
@@ -253,22 +275,27 @@ def main() -> None:
     )
     if not domain_id and not domain_name:
         print(
-            "Error: set one of OS_DOMAIN_ID, OS_DOMAIN_NAME, OS_PROJECT_DOMAIN_NAME, or OS_USER_DOMAIN_NAME",
+            "Error: set one of OS_DOMAIN_ID, OS_DOMAIN_NAME, "
+            "OS_PROJECT_DOMAIN_NAME, or OS_USER_DOMAIN_NAME",
             file=sys.stderr,
         )
-        sys.exit(1)
+        return 1
 
     try:
         import openstack
     except ImportError:
-        print("Error: openstacksdk is required. Install with: pip install openstacksdk", file=sys.stderr)
-        sys.exit(1)
+        print(
+            "Error: openstacksdk is required. Install with: pip install openstacksdk",
+            file=sys.stderr,
+        )
+        return 1
 
     # Connect using env vars (cloud='envvars' uses OS_* variables)
     conn = openstack.connect(cloud="envvars")
 
     # Do not call find_domain(domain_name): that requires identity:list_domains, which
-    # domain admins often lack. With only domain_name we list via domain_name filter or all visible.
+    # domain admins often lack. With only domain_name, list via domain_name
+    # filter or all visible projects.
 
     # List projects (optionally filtered by domain)
     try:
@@ -283,11 +310,15 @@ def main() -> None:
             projects = list(conn.identity.projects())
     except Exception as e:
         print(f"Error listing projects: {e}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     if not projects:
-        print("No projects found. Check domain and token scope (e.g. unscoped or domain-scoped).", file=sys.stderr)
-        sys.exit(1)
+        print(
+            "No projects found. Check domain and token scope "
+            "(e.g. unscoped or domain-scoped).",
+            file=sys.stderr,
+        )
+        return 1
 
     n_projects = len(projects)
     workers = max(1, min(args.workers, n_projects))
@@ -303,21 +334,35 @@ def main() -> None:
             )
             print(f"  [{idx}/{n_projects}] {name} ({pid})", file=sys.stderr)
             try:
-                conn_scoped = _connect_scoped_to_project(pid, p_dom_id, p_dom_name, fb_id, fb_name)
+                conn_scoped = _connect_scoped_to_project(
+                    pid, p_dom_id, p_dom_name, fb_id, fb_name
+                )
                 usage = get_quota_usage_sdk(conn_scoped, pid)
             except Exception as e:
-                print(f"Warning: could not get quota for project {name} ({pid}): {e}", file=sys.stderr)
+                print(
+                    f"Warning: could not get quota for project {name} ({pid}): {e}",
+                    file=sys.stderr,
+                )
                 usage = ZERO_QUOTA_USAGE.copy()
             project_usages.append((name, pid, usage))
             _accumulate_totals(totals, usage)
     else:
-        print(f"Found {n_projects} project(s). Fetching quota usage ({workers} workers)...", file=sys.stderr)
+        print(
+            f"Found {n_projects} project(s). Fetching quota usage ({workers} workers)...",
+            file=sys.stderr,
+        )
         # Snapshot OS_* env so workers have auth when using spawn (e.g. Windows)
         env_snapshot = {k: v for k, v in os.environ.items() if k.startswith("OS_")}
-        tasks = [(*_project_scope_args(project, domain_id, domain_name), env_snapshot) for project in projects]
+        tasks = [
+            (*_project_scope_args(project, domain_id, domain_name), env_snapshot)
+            for project in projects
+        ]
         results_by_index: list[tuple[int, tuple[str, str, dict]]] = []
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            future_to_index = {executor.submit(_fetch_quota_worker_unpack, t): i for i, t in enumerate(tasks)}
+            future_to_index = {
+                executor.submit(_fetch_quota_worker_unpack, t): i
+                for i, t in enumerate(tasks)
+            }
             done = 0
             for future in as_completed(future_to_index):
                 idx = future_to_index[future]
@@ -327,7 +372,10 @@ def main() -> None:
                 except Exception as e:
                     name = tasks[idx][0]
                     pid = tasks[idx][1]
-                    print(f"Warning: could not get quota for project {name} ({pid}): {e}", file=sys.stderr)
+                    print(
+                        f"Warning: could not get quota for project {name} ({pid}): {e}",
+                        file=sys.stderr,
+                    )
                     results_by_index.append((idx, (name, pid, ZERO_QUOTA_USAGE.copy())))
                 done += 1
                 msg = f"  Completed {done}/{n_projects}..."
@@ -345,7 +393,10 @@ def main() -> None:
     name_width = max(len(name) for name, _, _ in project_usages) if project_usages else 20
     name_width = max(name_width, 8)
     table_sep = 2 + name_width + 2 + w_c + 2 + w_r + 2 + w_s
-    header = f"  {'Project':<{name_width}}  {'cores':>{w_c}}  {'ram (GiB)':>{w_r}}  {'storage (TiB)':>{w_s}}"
+    header = (
+        f"  {'Project':<{name_width}}  {'cores':>{w_c}}  "
+        f"{'ram (GiB)':>{w_r}}  {'storage (TiB)':>{w_s}}"
+    )
     print("Project quota usage (cores, ram GiB, storage TiB):")
     print(header)
     print("  " + "-" * table_sep)
@@ -358,9 +409,16 @@ def main() -> None:
     t_c = totals["cores"]
     t_r = _ram_mb_to_gib(totals["ram"])
     t_s = _gb_to_tib(totals["gigabytes"])
-    print(f"  {'TOTAL':<{name_width}}  {t_c:>{w_c}}  {t_r:>{w_r}.2f}  {t_s:>{w_s}.2f}")
+    print(
+        f"  {'TOTAL':<{name_width}}  {t_c:>{w_c}}  "
+        f"{t_r:>{w_r}.2f}  {t_s:>{w_s}.2f}"
+    )
 
-    if args.limit_cores is not None or args.limit_ram is not None or args.limit_storage is not None:
+    if (
+        args.limit_cores is not None
+        or args.limit_ram is not None
+        or args.limit_storage is not None
+    ):
         lc, lr, ls = args.limit_cores, args.limit_ram, args.limit_storage
 
         def _cell_int(v: int | None) -> str:
@@ -385,4 +443,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
