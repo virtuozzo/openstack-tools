@@ -7,7 +7,7 @@ Small helper scripts for OpenStack administration.
 - Python 3.10+
 - OpenStack credentials in the usual `OS_*` environment variables
 - `openstacksdk` for `openstack-domain-quota-usage.py`
-- OpenStack CLI for `openstack-image-share.py`
+- OpenStack CLI for `openstack-image-share.py` and `openstack-project-cleanup.py`
 
 ```bash
 pip install -r requirements.txt
@@ -41,4 +41,17 @@ python3 openstack-image-share.py IMAGE_ID
 python3 openstack-image-share.py --add-image IMAGE_ID
 ```
 
-Run either script with `--help` for all options.
+## `openstack-project-cleanup.py`
+
+Lists project resources and prompts before deleting each group:
+
+- Deletes servers, volumes, floating IPs, routers, ports, networks, then the `ssh_key` keypair.
+- Detaches router interfaces before deleting routers.
+- Skips networks named `public`; only internal, vxlan, non-shared networks are eligible.
+
+```bash
+source openrc.sh
+python3 openstack-project-cleanup.py PROJECT_NAME
+```
+
+Run any script with `--help` for all options.
