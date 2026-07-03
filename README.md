@@ -46,6 +46,7 @@ python3 openstack-image-share.py --add-image IMAGE_ID
 Lists all project resources to be cleaned up, then asks once before deleting them:
 
 - Deletes servers, volumes, floating IPs, routers, ports, networks, then the `ssh_key` keypair.
+- Skips volumes attached to VMs with `delete_on_termination=True` (removed when the VM is deleted).
 - Detaches router interfaces before deleting routers.
 - Skips networks named `public`; only internal, vxlan, non-shared networks are eligible.
 

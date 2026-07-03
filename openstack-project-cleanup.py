@@ -66,6 +66,12 @@ def is_false_value(value: object) -> bool:
     return str(value).strip().casefold() in {"false", "no", "0"}
 
 
+def is_true_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"true", "yes", "1"}
+
+
 def is_internal_network(resource: dict[str, object]) -> bool:
     for field in ("Router Type", "router_type"):
         router_type_raw = resource_value(resource, field)
@@ -522,18 +528,108 @@ def filter_resources(kind: ResourceKind, env: dict[str, str]) -> ResourceGroup:
     return ResourceGroup(kind=kind, to_delete=to_delete, skipped=skipped)
 
 
+def server_volumes_attached(
+    server: dict[str, object],
+    env: dict[str, str],
+) -> list[dict[str, object]]:
+    server_id = resource_id(server)
+    server_name = str(resource_value(server, "Name") or server_id).strip()
+    output = command_output_or_raise(
+        [
+            "openstack",
+            "server",
+            "show",
+            server_id,
+            "-f",
+            "json",
+            "-c",
+            "volumes_attached",
+        ],
+        env,
+        f"Failed to get volumes for server {server_name}.",
+    )
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as e:
+        raise CleanupError(
+            f"Failed to parse volumes for server {server_name}: {e}"
+        ) from e
+
+    if isinstance(payload, list):
+        if not payload:
+            return []
+        payload = payload[0]
+
+    if not isinstance(payload, dict):
+        return []
+
+    attached = resource_value(payload, "volumes_attached")
+    if not isinstance(attached, list):
+        return []
+
+    return [item for item in attached if isinstance(item, dict)]
+
+
+def attachment_volume_id(attachment: dict[str, object]) -> str:
+    for field in ("id", "volume_id"):
+        value = attachment.get(field)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def attachment_delete_on_termination(attachment: dict[str, object]) -> bool:
+    for key, value in attachment.items():
+        if normalized_field_name(str(key)) == "deleteontermination":
+            return is_true_value(value)
+    return False
+
+
+def volumes_deleted_with_servers(
+    servers: list[dict[str, object]],
+    env: dict[str, str],
+) -> dict[str, str]:
+    """Map volume ID to server name for volumes with delete_on_termination=True."""
+    auto_delete: dict[str, str] = {}
+    for server in servers:
+        server_name = str(resource_value(server, "Name") or resource_id(server)).strip()
+        for attachment in server_volumes_attached(server, env):
+            volume_id = attachment_volume_id(attachment)
+            if volume_id and attachment_delete_on_termination(attachment):
+                auto_delete[volume_id] = server_name
+    return auto_delete
+
+
+def filter_volume_resources(
+    servers: list[dict[str, object]],
+    env: dict[str, str],
+) -> ResourceGroup:
+    all_volumes = list_resources(VOLUME_KIND, env)
+    auto_delete = volumes_deleted_with_servers(servers, env)
+
+    to_delete: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
+    for volume in all_volumes:
+        volume_id = resource_id(volume)
+        server_name = auto_delete.get(volume_id)
+        if server_name:
+            skipped.append({**volume, "_skip_reason": f"deleted with server {server_name}"})
+        else:
+            to_delete.append(volume)
+
+    return ResourceGroup(kind=VOLUME_KIND, to_delete=to_delete, skipped=skipped)
+
+
 def collect_cleanup_plan(env: dict[str, str]) -> list[ResourceGroup]:
-    kinds = (
-        SERVER_KIND,
-        VOLUME_KIND,
+    servers = filter_resources(SERVER_KIND, env)
+    plan: list[ResourceGroup] = [servers, filter_volume_resources(servers.to_delete, env)]
+    for kind in (
         FLOATING_IP_KIND,
         ROUTER_KIND,
         PORT_KIND,
         NETWORK_KIND,
         KEYPAIR_KIND,
-    )
-    plan: list[ResourceGroup] = []
-    for kind in kinds:
+    ):
         plan.append(filter_resources(kind, env))
     return plan
 
@@ -547,10 +643,15 @@ def print_cleanup_plan(plan: list[ResourceGroup]) -> int:
         print()
         print(f"{kind_display_name(group.kind)} ({len(group.to_delete)}):")
         if group.skipped:
-            print(f"  skipped {len(group.skipped)} by cleanup filters")
-            if group.kind.name == "networks":
+            if group.kind.name == "volumes":
+                print(f"  skipped {len(group.skipped)} (deleted with server):")
                 for resource in group.skipped:
                     print(f"    skipped: {resource_label(group.kind, resource)}")
+            else:
+                print(f"  skipped {len(group.skipped)} by cleanup filters")
+                if group.kind.name == "networks":
+                    for resource in group.skipped:
+                        print(f"    skipped: {resource_label(group.kind, resource)}")
         if not group.to_delete:
             print("  none")
             continue
