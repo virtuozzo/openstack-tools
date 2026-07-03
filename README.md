@@ -52,6 +52,7 @@ Lists all project resources to be cleaned up, then asks once before deleting the
 ```bash
 source openrc.sh
 python3 openstack-project-cleanup.py PROJECT_NAME
+python3 openstack-project-cleanup.py --dry-run PROJECT_NAME
 ```
 
 Run any script with `--help` for all options.

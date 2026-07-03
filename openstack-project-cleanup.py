@@ -264,6 +264,12 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         help="OpenStack project name to clean up; prompts interactively if omitted.",
     )
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="list resources that would be deleted without making changes.",
+    )
     return parser.parse_args()
 
 
@@ -625,6 +631,10 @@ def main() -> int:
     total = print_cleanup_plan(plan)
     if total == 0:
         print("Nothing to clean up.")
+        return 0
+
+    if args.dry_run:
+        print("Dry run: no resources were deleted.")
         return 0
 
     if not confirm(f"Delete all {total} resources listed above?"):
