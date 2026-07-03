@@ -43,7 +43,7 @@ python3 openstack-image-share.py --add-image IMAGE_ID
 
 ## `openstack-project-cleanup.py`
 
-Lists project resources and prompts before deleting each group:
+Lists all project resources to be cleaned up, then asks once before deleting them:
 
 - Deletes servers, volumes, floating IPs, routers, ports, networks, then the `ssh_key` keypair.
 - Detaches router interfaces before deleting routers.

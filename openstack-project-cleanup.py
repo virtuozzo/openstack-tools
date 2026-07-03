@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 
@@ -24,6 +24,13 @@ class ResourceKind:
 
 class CleanupError(RuntimeError):
     """Recoverable cleanup failure for one resource group."""
+
+
+@dataclass
+class ResourceGroup:
+    kind: ResourceKind
+    to_delete: list[dict[str, object]] = field(default_factory=list)
+    skipped: list[dict[str, object]] = field(default_factory=list)
 
 
 def normalized_field_name(field: str) -> str:
@@ -494,26 +501,61 @@ def cleanup_router(router: dict[str, object], env: dict[str, str]) -> bool:
     ) and ok
 
 
-def cleanup_routers(env: dict[str, str]) -> int:
-    try:
-        routers = list_resources(ROUTER_KIND, env)
-    except CleanupError as e:
-        print(e, file=sys.stderr)
-        return 1
+def kind_display_name(kind: ResourceKind) -> str:
+    return kind.name[:1].upper() + kind.name[1:]
 
+
+def filter_resources(kind: ResourceKind, env: dict[str, str]) -> ResourceGroup:
+    all_resources = list_resources(kind, env)
+    to_delete = [
+        resource for resource in all_resources if kind.include_resource(resource)
+    ]
+    skipped = [
+        resource for resource in all_resources if not kind.include_resource(resource)
+    ]
+    return ResourceGroup(kind=kind, to_delete=to_delete, skipped=skipped)
+
+
+def collect_cleanup_plan(env: dict[str, str]) -> list[ResourceGroup]:
+    kinds = (
+        SERVER_KIND,
+        VOLUME_KIND,
+        FLOATING_IP_KIND,
+        ROUTER_KIND,
+        PORT_KIND,
+        NETWORK_KIND,
+        KEYPAIR_KIND,
+    )
+    plan: list[ResourceGroup] = []
+    for kind in kinds:
+        plan.append(filter_resources(kind, env))
+    return plan
+
+
+def print_cleanup_plan(plan: list[ResourceGroup]) -> int:
+    total = 0
     print()
-    print(f"Routers ({len(routers)}):")
-    if not routers:
-        print("  none")
-        return 0
+    print("Resources to clean up:")
+    for group in plan:
+        total += len(group.to_delete)
+        print()
+        print(f"{kind_display_name(group.kind)} ({len(group.to_delete)}):")
+        if group.skipped:
+            print(f"  skipped {len(group.skipped)} by cleanup filters")
+            if group.kind.name == "networks":
+                for resource in group.skipped:
+                    print(f"    skipped: {resource_label(group.kind, resource)}")
+        if not group.to_delete:
+            print("  none")
+            continue
+        for index, resource in enumerate(group.to_delete, start=1):
+            print(f"  {index}. {resource_label(group.kind, resource)}")
+    print()
+    print(f"Total: {total} resource(s) to delete.")
+    return total
 
-    for index, router in enumerate(routers, start=1):
-        print(f"  {index}. {resource_label(ROUTER_KIND, router)}")
 
-    if not confirm(f"Delete all {len(routers)} routers?"):
-        print("Skipping routers.")
-        return 0
-
+def delete_routers(routers: list[dict[str, object]], env: dict[str, str]) -> int:
     failures = 0
     for router in routers:
         try:
@@ -526,41 +568,25 @@ def cleanup_routers(env: dict[str, str]) -> int:
     return failures
 
 
-# Generic list, prompt, and delete flow for resource kinds without special handling.
-def cleanup_kind(kind: ResourceKind, env: dict[str, str]) -> int:
-    try:
-        all_resources = list_resources(kind, env)
-    except CleanupError as e:
-        print(e, file=sys.stderr)
-        return 1
-    resources = [
-        resource for resource in all_resources if kind.include_resource(resource)
-    ]
-    skipped_count = len(all_resources) - len(resources)
-
-    print()
-    print(f"{kind.name[:1].upper() + kind.name[1:]} ({len(resources)}):")
-    if skipped_count:
-        print(f"  skipped {skipped_count} by cleanup filters")
-        if kind.name == "networks":
-            for resource in all_resources:
-                if not kind.include_resource(resource):
-                    print(f"    skipped: {resource_label(kind, resource)}")
-    if not resources:
-        print("  none")
-        return 0
-
-    for index, resource in enumerate(resources, start=1):
-        print(f"  {index}. {resource_label(kind, resource)}")
-
-    if not confirm(f"Delete all {len(resources)} {kind.name}?"):
-        print(f"Skipping {kind.name}.")
-        return 0
-
+def delete_kind_resources(group: ResourceGroup, env: dict[str, str]) -> int:
     failures = 0
-    for resource in resources:
-        if not delete_resource(kind, resource, env):
+    for resource in group.to_delete:
+        if not delete_resource(group.kind, resource, env):
             failures += 1
+    return failures
+
+
+def execute_cleanup_plan(plan: list[ResourceGroup], env: dict[str, str]) -> int:
+    failures = 0
+    for group in plan:
+        if not group.to_delete:
+            continue
+        print()
+        print(f"Deleting {kind_display_name(group.kind)}...")
+        if group.kind.name == "routers":
+            failures += delete_routers(group.to_delete, env)
+        else:
+            failures += delete_kind_resources(group, env)
     return failures
 
 
@@ -586,18 +612,26 @@ def main() -> int:
 
     print(f"Using OS_PROJECT_NAME={project_name}")
     print(
-        "Resources will be processed in this order: "
+        "Deletion order: "
         "server, volume, floating IP, router, port, network, keypair."
     )
 
-    failures = 0
-    failures += cleanup_kind(SERVER_KIND, env)
-    failures += cleanup_kind(VOLUME_KIND, env)
-    failures += cleanup_kind(FLOATING_IP_KIND, env)
-    failures += cleanup_routers(env)
-    failures += cleanup_kind(PORT_KIND, env)
-    failures += cleanup_kind(NETWORK_KIND, env)
-    failures += cleanup_kind(KEYPAIR_KIND, env)
+    try:
+        plan = collect_cleanup_plan(env)
+    except CleanupError as e:
+        print(e, file=sys.stderr)
+        return 1
+
+    total = print_cleanup_plan(plan)
+    if total == 0:
+        print("Nothing to clean up.")
+        return 0
+
+    if not confirm(f"Delete all {total} resources listed above?"):
+        print("Aborted.")
+        return 0
+
+    failures = execute_cleanup_plan(plan, env)
 
     print()
     if failures:
