@@ -8,8 +8,10 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Iterator
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,60 @@ class ResourceKind:
 
 class CleanupError(RuntimeError):
     """Recoverable cleanup failure for one resource group."""
+
+
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+class ProgressIndicator:
+    def __init__(self) -> None:
+        self._message = ""
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._interactive = sys.stderr.isatty()
+
+    def start(self, message: str) -> None:
+        self._message = message
+        if not self._interactive:
+            print(message, file=sys.stderr)
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def update(self, message: str) -> None:
+        self._message = message
+        if not self._interactive:
+            print(message, file=sys.stderr)
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join()
+        self._thread = None
+        if self._interactive:
+            sys.stderr.write("\r" + " " * 80 + "\r")
+            sys.stderr.flush()
+
+    def _run(self) -> None:
+        index = 0
+        while not self._stop.is_set():
+            frame = SPINNER_FRAMES[index % len(SPINNER_FRAMES)]
+            sys.stderr.write(f"\r{frame} {self._message}")
+            sys.stderr.flush()
+            index += 1
+            self._stop.wait(0.1)
+
+
+@contextmanager
+def progress(message: str) -> Iterator[ProgressIndicator]:
+    indicator = ProgressIndicator()
+    indicator.start(message)
+    try:
+        yield indicator
+    finally:
+        indicator.stop()
 
 
 @dataclass
@@ -517,6 +573,19 @@ def kind_display_name(kind: ResourceKind) -> str:
     return kind.name[:1].upper() + kind.name[1:]
 
 
+def gathering_message(kind: ResourceKind) -> str:
+    labels = {
+        "servers": "Gathering VM list...",
+        "volumes": "Gathering volume list...",
+        "floating IPs": "Gathering floating IP list...",
+        "routers": "Gathering router list...",
+        "ports": "Gathering port list...",
+        "networks": "Gathering network list...",
+        "keypairs": "Gathering keypair list...",
+    }
+    return labels.get(kind.name, f"Gathering {kind.name}...")
+
+
 def filter_resources(kind: ResourceKind, env: dict[str, str]) -> ResourceGroup:
     all_resources = list_resources(kind, env)
     to_delete = [
@@ -588,11 +657,17 @@ def attachment_delete_on_termination(attachment: dict[str, object]) -> bool:
 def volumes_deleted_with_servers(
     servers: list[dict[str, object]],
     env: dict[str, str],
+    indicator: ProgressIndicator | None = None,
 ) -> dict[str, str]:
     """Map volume ID to server name for volumes with delete_on_termination=True."""
     auto_delete: dict[str, str] = {}
-    for server in servers:
+    total = len(servers)
+    for index, server in enumerate(servers, start=1):
         server_name = str(resource_value(server, "Name") or resource_id(server)).strip()
+        if indicator and total:
+            indicator.update(
+                f"Checking VM volumes ({index}/{total}): {server_name}..."
+            )
         for attachment in server_volumes_attached(server, env):
             volume_id = attachment_volume_id(attachment)
             if volume_id and attachment_delete_on_termination(attachment):
@@ -603,9 +678,12 @@ def volumes_deleted_with_servers(
 def filter_volume_resources(
     servers: list[dict[str, object]],
     env: dict[str, str],
+    indicator: ProgressIndicator | None = None,
 ) -> ResourceGroup:
+    if indicator:
+        indicator.update(gathering_message(VOLUME_KIND))
     all_volumes = list_resources(VOLUME_KIND, env)
-    auto_delete = volumes_deleted_with_servers(servers, env)
+    auto_delete = volumes_deleted_with_servers(servers, env, indicator)
 
     to_delete: list[dict[str, object]] = []
     skipped: list[dict[str, object]] = []
@@ -621,8 +699,13 @@ def filter_volume_resources(
 
 
 def collect_cleanup_plan(env: dict[str, str]) -> list[ResourceGroup]:
-    servers = filter_resources(SERVER_KIND, env)
-    plan: list[ResourceGroup] = [servers, filter_volume_resources(servers.to_delete, env)]
+    with progress(gathering_message(SERVER_KIND)) as indicator:
+        servers = filter_resources(SERVER_KIND, env)
+
+    with progress(gathering_message(VOLUME_KIND)) as indicator:
+        volumes = filter_volume_resources(servers.to_delete, env, indicator)
+
+    plan: list[ResourceGroup] = [servers, volumes]
     for kind in (
         FLOATING_IP_KIND,
         ROUTER_KIND,
@@ -630,7 +713,8 @@ def collect_cleanup_plan(env: dict[str, str]) -> list[ResourceGroup]:
         NETWORK_KIND,
         KEYPAIR_KIND,
     ):
-        plan.append(filter_resources(kind, env))
+        with progress(gathering_message(kind)):
+            plan.append(filter_resources(kind, env))
     return plan
 
 
