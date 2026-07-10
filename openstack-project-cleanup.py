@@ -400,10 +400,90 @@ def resource_delete_identifier(kind: ResourceKind, resource: dict[str, object]) 
 def resource_label(kind: ResourceKind, resource: dict[str, object]) -> str:
     values = []
     for field in kind.label_fields:
-        value = str(resource_value(resource, field) or "").strip()
+        value = format_field_value(field, resource_value(resource, field))
         if value:
             values.append(value)
     return " / ".join(values) if values else "<unknown>"
+
+
+def format_field_value(field: str, value: object) -> str:
+    if value is None or value == "":
+        return ""
+
+    field_key = normalized_field_name(field)
+
+    if field_key in {"routertype", "router_type"}:
+        if isinstance(value, bool):
+            return "External" if value else "Internal"
+        text = str(value).strip()
+        if text.casefold() in {"true", "1", "yes"}:
+            return "External"
+        if text.casefold() in {"false", "0", "no"}:
+            return "Internal"
+        return text
+
+    if field_key in {"shared"}:
+        if isinstance(value, bool):
+            return "shared" if value else "not shared"
+        text = str(value).strip().casefold()
+        if text in {"true", "1", "yes"}:
+            return "shared"
+        if text in {"false", "0", "no"}:
+            return "not shared"
+        return str(value).strip()
+
+    if isinstance(value, bool):
+        return "True" if value else "False"
+
+    if field_key in {"fixedipaddresses", "fixedips"}:
+        if isinstance(value, list):
+            ips = []
+            for item in value:
+                if isinstance(item, dict):
+                    ip = str(item.get("ip_address") or "").strip()
+                    if ip:
+                        ips.append(ip)
+                else:
+                    text = str(item).strip()
+                    if text:
+                        ips.append(text)
+            return ", ".join(ips) if ips else ""
+        text = str(value).strip()
+        matches = re.findall(
+            r"'ip_address': '([^']+)'|\"ip_address\": \"([^\"]+)\"",
+            text,
+        )
+        ips = [part for match in matches for part in match if part]
+        return ", ".join(ips) if ips else text
+
+    if isinstance(value, list):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+
+    return str(value).strip()
+
+
+def print_openstack_table(headers: list[str], rows: list[list[str]]) -> None:
+    if not headers:
+        return
+
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    def border() -> str:
+        return "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+
+    def line(cells: list[str]) -> str:
+        parts = [f" {cell:<{widths[index]}} " for index, cell in enumerate(cells)]
+        return "|" + "|".join(parts) + "|"
+
+    print(border())
+    print(line(headers))
+    print(border())
+    for row in rows:
+        print(line(row))
+    print(border())
 
 
 def confirm(prompt: str) -> bool:
@@ -775,46 +855,95 @@ def collect_cleanup_plan(env: dict[str, str]) -> list[ResourceGroup]:
     return plan
 
 
+def resource_name_and_id(kind: ResourceKind, resource: dict[str, object]) -> tuple[str, str]:
+    if kind.name == "floating IPs":
+        name = format_field_value(
+            "Floating IP Address",
+            resource_value(resource, "Floating IP Address"),
+        )
+        rid = format_field_value("ID", resource_value(resource, "ID"))
+        return name, rid
+
+    if kind.name == "keypairs":
+        name = format_field_value("Name", resource_value(resource, "Name"))
+        return name, ""
+
+    name = format_field_value("Name", resource_value(resource, "Name"))
+    rid = format_field_value("ID", resource_value(resource, "ID"))
+    return name, rid
+
+
+def resource_details(kind: ResourceKind, resource: dict[str, object]) -> str:
+    skip_fields = {"Name", "ID", "Floating IP Address"}
+    parts = []
+    for field in kind.label_fields:
+        if field in skip_fields:
+            continue
+        value = format_field_value(field, resource_value(resource, field))
+        if value:
+            parts.append(value)
+    return ", ".join(parts)
+
+
+def skip_action(resource: dict[str, object]) -> str:
+    reason = str(resource.get("_skip_reason") or "").strip()
+    if reason.startswith("deleted with server"):
+        return f"skip ({reason})"
+    if reason == "router-owned":
+        return "skip (router-owned)"
+    if reason:
+        return f"skip ({reason})"
+    return "skip"
+
+
 def print_cleanup_plan(plan: list[ResourceGroup]) -> int:
     total = 0
+    rows: list[list[str]] = []
+
+    for group in plan:
+        type_name = kind_display_name(group.kind).rstrip("s")
+        if group.kind.name == "floating IPs":
+            type_name = "Floating IP"
+
+        for resource in group.to_delete:
+            total += 1
+            name, rid = resource_name_and_id(group.kind, resource)
+            rows.append(
+                [
+                    type_name,
+                    name,
+                    rid,
+                    resource_details(group.kind, resource),
+                    "delete",
+                ]
+            )
+
+        for resource in group.skipped:
+            # Router-owned ports are internal bookkeeping; keep the table focused.
+            if group.kind.name == "ports" and str(
+                resource.get("_skip_reason", "")
+            ) == "router-owned":
+                continue
+            name, rid = resource_name_and_id(group.kind, resource)
+            rows.append(
+                [
+                    type_name,
+                    name,
+                    rid,
+                    resource_details(group.kind, resource),
+                    skip_action(resource),
+                ]
+            )
+
     print()
     print("Resources to clean up:")
-    for group in plan:
-        total += len(group.to_delete)
-        print()
-        print(f"{kind_display_name(group.kind)} ({len(group.to_delete)}):")
-        if group.skipped:
-            if group.kind.name == "volumes":
-                print(f"  skipped {len(group.skipped)} (deleted with server):")
-                for resource in group.skipped:
-                    print(f"    skipped: {resource_label(group.kind, resource)}")
-            elif group.kind.name == "ports":
-                with_server = [
-                    resource
-                    for resource in group.skipped
-                    if str(resource.get("_skip_reason", "")).startswith("deleted with server")
-                ]
-                other = [
-                    resource
-                    for resource in group.skipped
-                    if resource not in with_server
-                ]
-                if with_server:
-                    print(f"  skipped {len(with_server)} (deleted with server):")
-                    for resource in with_server:
-                        print(f"    skipped: {resource_label(group.kind, resource)}")
-                if other:
-                    print(f"  skipped {len(other)} by cleanup filters")
-            else:
-                print(f"  skipped {len(group.skipped)} by cleanup filters")
-                if group.kind.name == "networks":
-                    for resource in group.skipped:
-                        print(f"    skipped: {resource_label(group.kind, resource)}")
-        if not group.to_delete:
-            print("  none")
-            continue
-        for index, resource in enumerate(group.to_delete, start=1):
-            print(f"  {index}. {resource_label(group.kind, resource)}")
+    if not rows:
+        print("None")
+    else:
+        print_openstack_table(
+            ["Type", "Name", "ID", "Details", "Action"],
+            rows,
+        )
     print()
     print(f"Total: {total} resource(s) to delete.")
     return total
