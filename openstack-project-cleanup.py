@@ -173,6 +173,10 @@ def is_router_owned_port(resource: dict[str, object]) -> bool:
     return normalized_resource_value(resource, "Device Owner").startswith("network:router")
 
 
+def is_compute_owned_port(resource: dict[str, object]) -> bool:
+    return normalized_resource_value(resource, "Device Owner").startswith("compute:")
+
+
 SERVER_KIND = ResourceKind(
     name="servers",
     list_command=[
@@ -207,10 +211,11 @@ PORT_KIND = ResourceKind(
         "Fixed IP Addresses",
         "-c",
         "Device Owner",
+        "-c",
+        "Device ID",
     ],
     delete_command=lambda resource_id: ["openstack", "port", "delete", resource_id],
     label_fields=("Name", "ID", "Fixed IP Addresses", "Device Owner"),
-    include_resource=lambda resource: not is_router_owned_port(resource),
 )
 
 ROUTER_KIND = ResourceKind(
@@ -406,6 +411,13 @@ def confirm(prompt: str) -> bool:
     return choice.lower().startswith("y")
 
 
+def already_gone_error(kind: ResourceKind, output: str) -> bool:
+    if kind.name != "ports":
+        return False
+    normalized = output.casefold()
+    return "no port found" in normalized or "could not be found" in normalized
+
+
 def delete_resource(
     kind: ResourceKind,
     resource: dict[str, object],
@@ -428,6 +440,10 @@ def delete_resource(
         if output:
             print(output)
         print(f"Deleting {kind.name}: {label}... done.")
+        return True
+
+    if already_gone_error(kind, output):
+        print(f"Deleting {kind.name}: {label}... already gone.")
         return True
 
     print(f"Deleting {kind.name}: {label}... failed.", file=sys.stderr)
@@ -698,6 +714,40 @@ def filter_volume_resources(
     return ResourceGroup(kind=VOLUME_KIND, to_delete=to_delete, skipped=skipped)
 
 
+def filter_port_resources(
+    servers: list[dict[str, object]],
+    env: dict[str, str],
+) -> ResourceGroup:
+    all_ports = list_resources(PORT_KIND, env)
+    server_ids = {resource_id(server) for server in servers if resource_id(server)}
+    server_names = {
+        resource_id(server): str(resource_value(server, "Name") or resource_id(server)).strip()
+        for server in servers
+        if resource_id(server)
+    }
+
+    to_delete: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
+    for port in all_ports:
+        if is_router_owned_port(port):
+            skipped.append({**port, "_skip_reason": "router-owned"})
+            continue
+
+        device_id = str(resource_value(port, "Device ID") or "").strip()
+        if is_compute_owned_port(port) and (
+            (device_id in server_ids) if device_id else bool(server_ids)
+        ):
+            server_name = server_names.get(device_id, "server")
+            skipped.append(
+                {**port, "_skip_reason": f"deleted with server {server_name}"}
+            )
+            continue
+
+        to_delete.append(port)
+
+    return ResourceGroup(kind=PORT_KIND, to_delete=to_delete, skipped=skipped)
+
+
 def collect_cleanup_plan(env: dict[str, str]) -> list[ResourceGroup]:
     with progress(gathering_message(SERVER_KIND)) as indicator:
         servers = filter_resources(SERVER_KIND, env)
@@ -709,7 +759,14 @@ def collect_cleanup_plan(env: dict[str, str]) -> list[ResourceGroup]:
     for kind in (
         FLOATING_IP_KIND,
         ROUTER_KIND,
-        PORT_KIND,
+    ):
+        with progress(gathering_message(kind)):
+            plan.append(filter_resources(kind, env))
+
+    with progress(gathering_message(PORT_KIND)):
+        plan.append(filter_port_resources(servers.to_delete, env))
+
+    for kind in (
         NETWORK_KIND,
         KEYPAIR_KIND,
     ):
@@ -731,6 +788,23 @@ def print_cleanup_plan(plan: list[ResourceGroup]) -> int:
                 print(f"  skipped {len(group.skipped)} (deleted with server):")
                 for resource in group.skipped:
                     print(f"    skipped: {resource_label(group.kind, resource)}")
+            elif group.kind.name == "ports":
+                with_server = [
+                    resource
+                    for resource in group.skipped
+                    if str(resource.get("_skip_reason", "")).startswith("deleted with server")
+                ]
+                other = [
+                    resource
+                    for resource in group.skipped
+                    if resource not in with_server
+                ]
+                if with_server:
+                    print(f"  skipped {len(with_server)} (deleted with server):")
+                    for resource in with_server:
+                        print(f"    skipped: {resource_label(group.kind, resource)}")
+                if other:
+                    print(f"  skipped {len(other)} by cleanup filters")
             else:
                 print(f"  skipped {len(group.skipped)} by cleanup filters")
                 if group.kind.name == "networks":
