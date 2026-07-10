@@ -9,9 +9,19 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Iterator
+
+
+EXIT_OK = 0
+EXIT_FAILURE = 1
+EXIT_USAGE = 2
+
+DEFAULT_COMMAND_TIMEOUT = 120
+DEFAULT_WAIT_TIMEOUT = 600
+DEFAULT_WAIT_INTERVAL = 5.0
 
 
 @dataclass(frozen=True)
@@ -28,7 +38,78 @@ class CleanupError(RuntimeError):
     """Recoverable cleanup failure for one resource group."""
 
 
-SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+class FailFastError(CleanupError):
+    """Abort remaining deletions after the first failure."""
+
+
+class UsageError(Exception):
+    """Invalid CLI usage / non-interactive misuse."""
+
+
+@dataclass
+class RuntimeOptions:
+    quiet: bool = False
+    fail_fast: bool = False
+    wait: bool = True
+    wait_timeout: int = DEFAULT_WAIT_TIMEOUT
+    wait_interval: float = DEFAULT_WAIT_INTERVAL
+    command_timeout: int = DEFAULT_COMMAND_TIMEOUT
+    github: bool = False
+
+
+SPINNER_FRAMES = "⠋⠙⠹⠼⠼⠴⠦⠧⠇⠏"
+
+
+def is_ci() -> bool:
+    for key in ("CI", "GITHUB_ACTIONS"):
+        if os.environ.get(key, "").strip().casefold() in {"1", "true", "yes"}:
+            return True
+    return False
+
+
+def is_noninteractive() -> bool:
+    return is_ci() or not sys.stdin.isatty()
+
+
+def use_github_output(explicit: bool | None = None) -> bool:
+    if explicit is not None:
+        return explicit
+    return os.environ.get("GITHUB_ACTIONS", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def github_escape(message: str) -> str:
+    return (
+        message.replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+
+
+def emit_github_annotation(level: str, message: str, options: RuntimeOptions) -> None:
+    if not options.github:
+        return
+    print(f"::{level}::{github_escape(message)}", file=sys.stderr)
+
+
+def log_info(message: str, options: RuntimeOptions, *, force: bool = False) -> None:
+    if options.quiet and not force:
+        return
+    print(message)
+
+
+def log_error(message: str, options: RuntimeOptions) -> None:
+    emit_github_annotation("error", message, options)
+    print(message, file=sys.stderr)
+
+
+def log_warning(message: str, options: RuntimeOptions) -> None:
+    emit_github_annotation("warning", message, options)
+    print(message, file=sys.stderr)
+
 
 
 class ProgressIndicator:
@@ -325,19 +406,101 @@ def require_openstack_cli() -> bool:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Delete common OpenStack resources from one project.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Exit codes:\n"
+            f"  {EXIT_OK}  success / nothing to do / dry-run OK\n"
+            f"  {EXIT_FAILURE}  OpenStack or operational failure\n"
+            f"  {EXIT_USAGE}  usage / non-interactive misuse "
+            "(missing project name or missing --yes)\n"
+        ),
     )
     parser.add_argument(
         "project_name",
         nargs="?",
-        help="OpenStack project name to clean up; prompts interactively if omitted.",
+        help="OpenStack project name to clean up",
     )
     parser.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
-        help="list resources that would be deleted without making changes.",
+        help="List resources that would be deleted, then exit without deleting",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt and delete listed resources",
+    )
+    parser.add_argument(
+        "--wait",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "After deleting servers/volumes, wait until they are gone before "
+            "continuing (default: on in CI or with --yes)"
+        ),
+    )
+    parser.add_argument(
+        "--wait-timeout",
+        type=int,
+        default=DEFAULT_WAIT_TIMEOUT,
+        metavar="SECONDS",
+        help=f"Max seconds to wait for async deletes (default: {DEFAULT_WAIT_TIMEOUT})",
+    )
+    parser.add_argument(
+        "--wait-interval",
+        type=float,
+        default=DEFAULT_WAIT_INTERVAL,
+        metavar="SECONDS",
+        help=f"Seconds between wait polls (default: {DEFAULT_WAIT_INTERVAL})",
+    )
+    parser.add_argument(
+        "--command-timeout",
+        type=int,
+        default=DEFAULT_COMMAND_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            "Timeout for each openstack CLI call "
+            f"(default: {DEFAULT_COMMAND_TIMEOUT})"
+        ),
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Abort on the first deletion failure",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress per-resource delete chatter; keep plan table and summary",
+    )
+    parser.add_argument(
+        "--github",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Emit GitHub Actions annotations and write GITHUB_STEP_SUMMARY "
+            "(default: on when GITHUB_ACTIONS is set)"
+        ),
     )
     return parser.parse_args()
+
+
+def runtime_options_from_args(args: argparse.Namespace) -> RuntimeOptions:
+    wait = args.wait
+    if wait is None:
+        wait = bool(args.yes) or is_ci()
+
+    return RuntimeOptions(
+        quiet=bool(args.quiet),
+        fail_fast=bool(args.fail_fast),
+        wait=bool(wait),
+        wait_timeout=max(1, int(args.wait_timeout)),
+        wait_interval=max(0.1, float(args.wait_interval)),
+        command_timeout=max(1, int(args.command_timeout)),
+        github=use_github_output(args.github),
+    )
 
 
 def project_env(project_name: str) -> dict[str, str]:
@@ -350,16 +513,30 @@ def project_env(project_name: str) -> dict[str, str]:
 def run_command(
     command: list[str],
     env: dict[str, str],
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, capture_output=True, env=env, text=True)
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            env=env,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        cmd_name = " ".join(command[:3]) if command else "command"
+        raise CleanupError(
+            f"Timed out after {timeout}s running: {cmd_name}"
+        ) from e
 
 
 def command_output_or_raise(
     command: list[str],
     env: dict[str, str],
     failure_message: str,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
 ) -> str:
-    result = run_command(command, env)
+    result = run_command(command, env, timeout=timeout)
     output = (result.stdout + result.stderr).strip()
     if result.returncode != 0:
         message = f"{failure_message}\n{output}" if output else failure_message
@@ -367,11 +544,16 @@ def command_output_or_raise(
     return result.stdout
 
 
-def list_resources(kind: ResourceKind, env: dict[str, str]) -> list[dict[str, object]]:
+def list_resources(
+    kind: ResourceKind,
+    env: dict[str, str],
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
+) -> list[dict[str, object]]:
     output = command_output_or_raise(
         kind.list_command,
         env,
         f"Failed to list {kind.name}.",
+        timeout=timeout,
     )
     try:
         resources = json.loads(output)
@@ -502,33 +684,45 @@ def delete_resource(
     kind: ResourceKind,
     resource: dict[str, object],
     env: dict[str, str],
+    options: RuntimeOptions,
 ) -> bool:
     identifier = resource_delete_identifier(kind, resource)
     if not identifier:
-        print(
+        log_error(
             f"Skipping {kind.name} item without a delete identifier: {resource}",
-            file=sys.stderr,
+            options,
         )
+        if options.fail_fast:
+            raise FailFastError(
+                f"Missing delete identifier for {kind.name}"
+            )
         return False
 
     label = resource_label(kind, resource)
-    print(f"Deleting {kind.name}: {label}...")
-    result = run_command(kind.delete_command(identifier), env)
+    log_info(f"Deleting {kind.name}: {label}...", options)
+    result = run_command(
+        kind.delete_command(identifier),
+        env,
+        timeout=options.command_timeout,
+    )
     output = (result.stdout + result.stderr).strip()
 
     if result.returncode == 0:
         if output:
-            print(output)
-        print(f"Deleting {kind.name}: {label}... done.")
+            log_info(output, options)
+        log_info(f"Deleting {kind.name}: {label}... done.", options)
         return True
 
     if already_gone_error(kind, output):
-        print(f"Deleting {kind.name}: {label}... already gone.")
+        log_info(f"Deleting {kind.name}: {label}... already gone.", options)
         return True
 
-    print(f"Deleting {kind.name}: {label}... failed.", file=sys.stderr)
+    message = f"Deleting {kind.name}: {label}... failed."
     if output:
-        print(output, file=sys.stderr)
+        message = f"{message}\n{output}"
+    log_error(message, options)
+    if options.fail_fast:
+        raise FailFastError(message)
     return False
 
 
@@ -536,33 +730,41 @@ def run_openstack_action(
     description: str,
     command: list[str],
     env: dict[str, str],
+    options: RuntimeOptions,
     ignore_failure_patterns: tuple[str, ...] = (),
 ) -> bool:
-    print(f"{description}...")
-    result = run_command(command, env)
+    log_info(f"{description}...", options)
+    result = run_command(command, env, timeout=options.command_timeout)
     output = (result.stdout + result.stderr).strip()
 
     if result.returncode == 0:
         if output:
-            print(output)
-        print(f"{description}... done.")
+            log_info(output, options)
+        log_info(f"{description}... done.", options)
         return True
 
     output_normalized = output.casefold()
     if any(pattern.casefold() in output_normalized for pattern in ignore_failure_patterns):
         if output:
-            print(output)
-        print(f"{description}... skipped.")
+            log_info(output, options)
+        log_info(f"{description}... skipped.", options)
         return True
 
-    print(f"{description}... failed.", file=sys.stderr)
+    message = f"{description}... failed."
     if output:
-        print(output, file=sys.stderr)
+        message = f"{message}\n{output}"
+    log_error(message, options)
+    if options.fail_fast:
+        raise FailFastError(message)
     return False
 
 
 # Router cleanup needs Neutron router operations instead of generic port deletion.
-def router_ports(router_id: str, env: dict[str, str]) -> list[dict[str, object]]:
+def router_ports(
+    router_id: str,
+    env: dict[str, str],
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
+) -> list[dict[str, object]]:
     output = command_output_or_raise(
         [
             "openstack",
@@ -583,6 +785,7 @@ def router_ports(router_id: str, env: dict[str, str]) -> list[dict[str, object]]
         ],
         env,
         f"Failed to list ports for router {router_id}.",
+        timeout=timeout,
     )
     try:
         ports = json.loads(output)
@@ -614,10 +817,17 @@ def fixed_ip_subnet_ids(port: dict[str, object]) -> list[str]:
     return []
 
 
-def remove_router_port(router_id: str, port: dict[str, object], env: dict[str, str]) -> bool:
+def remove_router_port(
+    router_id: str,
+    port: dict[str, object],
+    env: dict[str, str],
+    options: RuntimeOptions,
+) -> bool:
     port_id = resource_id(port)
     if not port_id:
-        print(f"Skipping router port without an ID: {port}", file=sys.stderr)
+        log_error(f"Skipping router port without an ID: {port}", options)
+        if options.fail_fast:
+            raise FailFastError(f"Router port missing ID on router {router_id}")
         return False
 
     label = resource_label(PORT_KIND, port)
@@ -627,6 +837,7 @@ def remove_router_port(router_id: str, port: dict[str, object], env: dict[str, s
             f"Removing subnet {subnet_id} from router {router_id}",
             ["openstack", "router", "remove", "subnet", router_id, subnet_id],
             env,
+            options,
         ):
             return True
 
@@ -634,13 +845,20 @@ def remove_router_port(router_id: str, port: dict[str, object], env: dict[str, s
         f"Removing port {label} from router {router_id}",
         ["openstack", "router", "remove", "port", router_id, port_id],
         env,
+        options,
     )
 
 
-def cleanup_router(router: dict[str, object], env: dict[str, str]) -> bool:
+def cleanup_router(
+    router: dict[str, object],
+    env: dict[str, str],
+    options: RuntimeOptions,
+) -> bool:
     router_id = resource_id(router)
     if not router_id:
-        print(f"Skipping router without an ID: {router}", file=sys.stderr)
+        log_error(f"Skipping router without an ID: {router}", options)
+        if options.fail_fast:
+            raise FailFastError("Router missing ID")
         return False
 
     label = resource_label(ROUTER_KIND, router)
@@ -648,6 +866,7 @@ def cleanup_router(router: dict[str, object], env: dict[str, str]) -> bool:
         f"Unsetting external gateway for router {label}",
         ["openstack", "router", "unset", "--external-gateway", router_id],
         env,
+        options,
         ignore_failure_patterns=(
             "no external gateway",
             "not currently set",
@@ -655,13 +874,14 @@ def cleanup_router(router: dict[str, object], env: dict[str, str]) -> bool:
         ),
     )
 
-    for port in router_ports(router_id, env):
-        ok = remove_router_port(router_id, port, env) and ok
+    for port in router_ports(router_id, env, timeout=options.command_timeout):
+        ok = remove_router_port(router_id, port, env, options) and ok
 
     return run_openstack_action(
         f"Deleting routers: {label}",
         ["openstack", "router", "delete", router_id],
         env,
+        options,
     ) and ok
 
 
@@ -682,8 +902,12 @@ def gathering_message(kind: ResourceKind) -> str:
     return labels.get(kind.name, f"Gathering {kind.name}...")
 
 
-def filter_resources(kind: ResourceKind, env: dict[str, str]) -> ResourceGroup:
-    all_resources = list_resources(kind, env)
+def filter_resources(
+    kind: ResourceKind,
+    env: dict[str, str],
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
+) -> ResourceGroup:
+    all_resources = list_resources(kind, env, timeout=timeout)
     to_delete = [
         resource for resource in all_resources if kind.include_resource(resource)
     ]
@@ -696,6 +920,7 @@ def filter_resources(kind: ResourceKind, env: dict[str, str]) -> ResourceGroup:
 def server_volumes_attached(
     server: dict[str, object],
     env: dict[str, str],
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
 ) -> list[dict[str, object]]:
     server_id = resource_id(server)
     server_name = str(resource_value(server, "Name") or server_id).strip()
@@ -712,6 +937,7 @@ def server_volumes_attached(
         ],
         env,
         f"Failed to get volumes for server {server_name}.",
+        timeout=timeout,
     )
     try:
         payload = json.loads(output)
@@ -754,6 +980,7 @@ def volumes_deleted_with_servers(
     servers: list[dict[str, object]],
     env: dict[str, str],
     indicator: ProgressIndicator | None = None,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
 ) -> dict[str, str]:
     """Map volume ID to server name for volumes with delete_on_termination=True."""
     auto_delete: dict[str, str] = {}
@@ -764,7 +991,7 @@ def volumes_deleted_with_servers(
             indicator.update(
                 f"Checking VM volumes ({index}/{total}): {server_name}..."
             )
-        for attachment in server_volumes_attached(server, env):
+        for attachment in server_volumes_attached(server, env, timeout=timeout):
             volume_id = attachment_volume_id(attachment)
             if volume_id and attachment_delete_on_termination(attachment):
                 auto_delete[volume_id] = server_name
@@ -775,11 +1002,14 @@ def filter_volume_resources(
     servers: list[dict[str, object]],
     env: dict[str, str],
     indicator: ProgressIndicator | None = None,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
 ) -> ResourceGroup:
     if indicator:
         indicator.update(gathering_message(VOLUME_KIND))
-    all_volumes = list_resources(VOLUME_KIND, env)
-    auto_delete = volumes_deleted_with_servers(servers, env, indicator)
+    all_volumes = list_resources(VOLUME_KIND, env, timeout=timeout)
+    auto_delete = volumes_deleted_with_servers(
+        servers, env, indicator, timeout=timeout
+    )
 
     to_delete: list[dict[str, object]] = []
     skipped: list[dict[str, object]] = []
@@ -797,8 +1027,9 @@ def filter_volume_resources(
 def filter_port_resources(
     servers: list[dict[str, object]],
     env: dict[str, str],
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
 ) -> ResourceGroup:
-    all_ports = list_resources(PORT_KIND, env)
+    all_ports = list_resources(PORT_KIND, env, timeout=timeout)
     server_ids = {resource_id(server) for server in servers if resource_id(server)}
     server_names = {
         resource_id(server): str(resource_value(server, "Name") or resource_id(server)).strip()
@@ -828,12 +1059,18 @@ def filter_port_resources(
     return ResourceGroup(kind=PORT_KIND, to_delete=to_delete, skipped=skipped)
 
 
-def collect_cleanup_plan(env: dict[str, str]) -> list[ResourceGroup]:
+def collect_cleanup_plan(
+    env: dict[str, str],
+    options: RuntimeOptions,
+) -> list[ResourceGroup]:
+    timeout = options.command_timeout
     with progress(gathering_message(SERVER_KIND)) as indicator:
-        servers = filter_resources(SERVER_KIND, env)
+        servers = filter_resources(SERVER_KIND, env, timeout=timeout)
 
     with progress(gathering_message(VOLUME_KIND)) as indicator:
-        volumes = filter_volume_resources(servers.to_delete, env, indicator)
+        volumes = filter_volume_resources(
+            servers.to_delete, env, indicator, timeout=timeout
+        )
 
     plan: list[ResourceGroup] = [servers, volumes]
     for kind in (
@@ -841,17 +1078,19 @@ def collect_cleanup_plan(env: dict[str, str]) -> list[ResourceGroup]:
         ROUTER_KIND,
     ):
         with progress(gathering_message(kind)):
-            plan.append(filter_resources(kind, env))
+            plan.append(filter_resources(kind, env, timeout=timeout))
 
     with progress(gathering_message(PORT_KIND)):
-        plan.append(filter_port_resources(servers.to_delete, env))
+        plan.append(
+            filter_port_resources(servers.to_delete, env, timeout=timeout)
+        )
 
     for kind in (
         NETWORK_KIND,
         KEYPAIR_KIND,
     ):
         with progress(gathering_message(kind)):
-            plan.append(filter_resources(kind, env))
+            plan.append(filter_resources(kind, env, timeout=timeout))
     return plan
 
 
@@ -896,7 +1135,7 @@ def skip_action(resource: dict[str, object]) -> str:
     return "skip"
 
 
-def print_cleanup_plan(plan: list[ResourceGroup]) -> int:
+def build_plan_rows(plan: list[ResourceGroup]) -> tuple[list[list[str]], int]:
     total = 0
     rows: list[list[str]] = []
 
@@ -935,6 +1174,12 @@ def print_cleanup_plan(plan: list[ResourceGroup]) -> int:
                 ]
             )
 
+    return rows, total
+
+
+def print_cleanup_plan(plan: list[ResourceGroup]) -> int:
+    rows, total = build_plan_rows(plan)
+
     print()
     print("Resources to clean up:")
     if not rows:
@@ -949,28 +1194,184 @@ def print_cleanup_plan(plan: list[ResourceGroup]) -> int:
     return total
 
 
-def delete_routers(routers: list[dict[str, object]], env: dict[str, str]) -> int:
+def write_github_step_summary(
+    project_name: str,
+    plan: list[ResourceGroup],
+    total: int,
+    *,
+    dry_run: bool,
+    failures: int | None,
+    options: RuntimeOptions,
+) -> None:
+    if not options.github:
+        return
+
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+
+    rows, _ = build_plan_rows(plan)
+    lines = [
+        f"## OpenStack project cleanup: `{project_name}`",
+        "",
+        f"- Resources to delete: **{total}**",
+        f"- Dry run: **{'yes' if dry_run else 'no'}**",
+    ]
+    if failures is not None:
+        lines.append(f"- Deletion failures: **{failures}**")
+    lines.extend(["", "| Type | Name | ID | Details | Action |", "| --- | --- | --- | --- | --- |"])
+    if not rows:
+        lines.append("| — | — | — | — | none |")
+    else:
+        for row in rows:
+            cells = [cell.replace("|", "\\|") for cell in row]
+            lines.append("| " + " | ".join(cells) + " |")
+    lines.append("")
+
+    with open(summary_path, "a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+
+
+def resource_not_found(output: str) -> bool:
+    normalized = output.casefold()
+    markers = (
+        "could not be found",
+        "no server with a name or id",
+        "no volume with a name or id",
+        "no volume found",
+        "no server found",
+        "not found",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def wait_until_gone(
+    kind: ResourceKind,
+    resource: dict[str, object],
+    show_command: list[str],
+    env: dict[str, str],
+    options: RuntimeOptions,
+) -> None:
+    identifier = resource_delete_identifier(kind, resource)
+    label = resource_label(kind, resource)
+    if not identifier:
+        return
+
+    singular = kind.name.rstrip("s")
+    deadline = time.monotonic() + options.wait_timeout
+    log_info(
+        f"Waiting for {singular} {label} to disappear "
+        f"(timeout {options.wait_timeout}s)...",
+        options,
+    )
+
+    while True:
+        result = run_command(
+            show_command,
+            env,
+            timeout=options.command_timeout,
+        )
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode != 0 and resource_not_found(output):
+            log_info(f"Waiting for {singular} {label}... gone.", options)
+            return
+        if result.returncode != 0 and not resource_not_found(output):
+            message = (
+                f"Failed while waiting for {singular} {label} to disappear."
+            )
+            if output:
+                message = f"{message}\n{output}"
+            raise CleanupError(message)
+
+        if time.monotonic() >= deadline:
+            raise CleanupError(
+                f"Timed out after {options.wait_timeout}s waiting for "
+                f"{singular} {label} to disappear"
+            )
+        time.sleep(options.wait_interval)
+
+
+def wait_for_deleted_resources(
+    kind: ResourceKind,
+    resources: list[dict[str, object]],
+    env: dict[str, str],
+    options: RuntimeOptions,
+) -> None:
+    if not options.wait or not resources:
+        return
+
+    for resource in resources:
+        identifier = resource_delete_identifier(kind, resource)
+        if not identifier:
+            continue
+        if kind.name == "servers":
+            show_command = [
+                "openstack",
+                "server",
+                "show",
+                identifier,
+                "-f",
+                "value",
+                "-c",
+                "id",
+            ]
+        elif kind.name == "volumes":
+            show_command = [
+                "openstack",
+                "volume",
+                "show",
+                identifier,
+                "-f",
+                "value",
+                "-c",
+                "id",
+            ]
+        else:
+            continue
+        wait_until_gone(kind, resource, show_command, env, options)
+
+
+def delete_routers(
+    routers: list[dict[str, object]],
+    env: dict[str, str],
+    options: RuntimeOptions,
+) -> int:
     failures = 0
     for router in routers:
         try:
-            ok = cleanup_router(router, env)
+            ok = cleanup_router(router, env, options)
+        except FailFastError:
+            raise
         except CleanupError as e:
-            print(e, file=sys.stderr)
+            log_error(str(e), options)
             ok = False
         if not ok:
             failures += 1
+            if options.fail_fast:
+                raise FailFastError("Router deletion failed")
     return failures
 
 
-def delete_kind_resources(group: ResourceGroup, env: dict[str, str]) -> int:
+def delete_kind_resources(
+    group: ResourceGroup,
+    env: dict[str, str],
+    options: RuntimeOptions,
+) -> tuple[int, list[dict[str, object]]]:
     failures = 0
+    deleted: list[dict[str, object]] = []
     for resource in group.to_delete:
-        if not delete_resource(group.kind, resource, env):
+        if delete_resource(group.kind, resource, env, options):
+            deleted.append(resource)
+        else:
             failures += 1
-    return failures
+    return failures, deleted
 
 
-def execute_cleanup_plan(plan: list[ResourceGroup], env: dict[str, str]) -> int:
+def execute_cleanup_plan(
+    plan: list[ResourceGroup],
+    env: dict[str, str],
+    options: RuntimeOptions,
+) -> int:
     failures = 0
     for group in plan:
         if not group.to_delete:
@@ -978,15 +1379,26 @@ def execute_cleanup_plan(plan: list[ResourceGroup], env: dict[str, str]) -> int:
         print()
         print(f"Deleting {kind_display_name(group.kind)}...")
         if group.kind.name == "routers":
-            failures += delete_routers(group.to_delete, env)
+            failures += delete_routers(group.to_delete, env, options)
+            deleted: list[dict[str, object]] = []
         else:
-            failures += delete_kind_resources(group, env)
+            kind_failures, deleted = delete_kind_resources(group, env, options)
+            failures += kind_failures
+
+        if group.kind.name in {"servers", "volumes"}:
+            wait_for_deleted_resources(group.kind, deleted, env, options)
     return failures
 
 
 def get_project_name(project_name: str | None) -> str:
     if project_name:
         return project_name
+
+    if is_noninteractive():
+        raise UsageError(
+            "Project name is required in non-interactive mode "
+            "(CI or non-TTY). Pass PROJECT_NAME as an argument."
+        )
 
     while True:
         project_name = input("Enter project name to clean up: ").strip()
@@ -997,11 +1409,24 @@ def get_project_name(project_name: str | None) -> str:
 
 def main() -> int:
     args = parse_args()
+    options = runtime_options_from_args(args)
 
     if not require_openstack_cli():
-        return 1
+        return EXIT_FAILURE
 
-    project_name = get_project_name(args.project_name)
+    try:
+        project_name = get_project_name(args.project_name)
+    except UsageError as e:
+        log_error(str(e), options)
+        return EXIT_USAGE
+
+    if not args.dry_run and not args.yes and is_noninteractive():
+        log_error(
+            "Non-interactive mode requires --yes (or --dry-run) to proceed.",
+            options,
+        )
+        return EXIT_USAGE
+
     env = project_env(project_name)
 
     print(f"Using OS_PROJECT_NAME={project_name}")
@@ -1011,33 +1436,102 @@ def main() -> int:
     )
 
     try:
-        plan = collect_cleanup_plan(env)
+        plan = collect_cleanup_plan(env, options)
     except CleanupError as e:
-        print(e, file=sys.stderr)
-        return 1
+        log_error(str(e), options)
+        return EXIT_FAILURE
 
     total = print_cleanup_plan(plan)
+
     if total == 0:
         print("Nothing to clean up.")
-        return 0
+        write_github_step_summary(
+            project_name,
+            plan,
+            total,
+            dry_run=bool(args.dry_run),
+            failures=0,
+            options=options,
+        )
+        return EXIT_OK
 
     if args.dry_run:
         print("Dry run: no resources were deleted.")
-        return 0
+        write_github_step_summary(
+            project_name,
+            plan,
+            total,
+            dry_run=True,
+            failures=0,
+            options=options,
+        )
+        return EXIT_OK
 
-    if not confirm(f"Delete all {total} resources listed above?"):
-        print("Aborted.")
-        return 0
+    if not args.yes:
+        if is_noninteractive():
+            log_error(
+                "Non-interactive mode requires --yes to delete resources.",
+                options,
+            )
+            return EXIT_USAGE
+        if not confirm(f"Delete all {total} resources listed above?"):
+            print("Aborted.")
+            return EXIT_OK
 
-    failures = execute_cleanup_plan(plan, env)
+    if args.yes:
+        print(f"Deleting {total} resources (--yes)...")
+
+    try:
+        failures = execute_cleanup_plan(plan, env, options)
+    except FailFastError as e:
+        log_error(str(e), options)
+        write_github_step_summary(
+            project_name,
+            plan,
+            total,
+            dry_run=False,
+            failures=1,
+            options=options,
+        )
+        return EXIT_FAILURE
+    except CleanupError as e:
+        log_error(str(e), options)
+        write_github_step_summary(
+            project_name,
+            plan,
+            total,
+            dry_run=False,
+            failures=1,
+            options=options,
+        )
+        return EXIT_FAILURE
 
     print()
     if failures:
-        print(f"Completed with {failures} deletion failure(s).", file=sys.stderr)
-        return 1
+        log_error(
+            f"Completed with {failures} deletion failure(s).",
+            options,
+        )
+        write_github_step_summary(
+            project_name,
+            plan,
+            total,
+            dry_run=False,
+            failures=failures,
+            options=options,
+        )
+        return EXIT_FAILURE
 
     print("Completed successfully.")
-    return 0
+    write_github_step_summary(
+        project_name,
+        plan,
+        total,
+        dry_run=False,
+        failures=0,
+        options=options,
+    )
+    return EXIT_OK
 
 
 if __name__ == "__main__":

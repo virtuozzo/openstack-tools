@@ -50,11 +50,38 @@ Lists all project resources to be cleaned up, then asks once before deleting the
 - Skips compute ports attached to VMs (removed when the VM is deleted).
 - Detaches router interfaces before deleting routers.
 - Skips networks named `public`; only internal, vxlan, non-shared networks are eligible.
+- With `--wait` (default in CI or with `--yes`), polls until deleted servers/volumes are gone before continuing.
 
 ```bash
 source openrc.sh
 python3 openstack-project-cleanup.py PROJECT_NAME
 python3 openstack-project-cleanup.py --dry-run PROJECT_NAME
+python3 openstack-project-cleanup.py --yes PROJECT_NAME
 ```
+
+### GitHub Actions
+
+In CI / non-TTY environments the script never prompts. Pass the project name and either `--yes` or `--dry-run`. Standard `OS_*` credentials must be present in the job environment.
+
+```bash
+python3 openstack-project-cleanup.py --yes --wait --fail-fast --quiet PROJECT_NAME
+```
+
+Useful CI options:
+
+- `--wait` / `--no-wait` — wait for async server/volume deletes (default on in CI or with `--yes`)
+- `--wait-timeout` / `--wait-interval` — wait polling controls (defaults: 600s / 5s)
+- `--command-timeout` — per-CLI-call timeout (default: 120s)
+- `--fail-fast` — abort on the first deletion failure
+- `--quiet` — keep the plan table and final summary; suppress per-resource chatter
+- `--github` — emit `::error::` / `::warning::` annotations and append a markdown table to `$GITHUB_STEP_SUMMARY` (on by default when `GITHUB_ACTIONS` is set)
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success, nothing to do, or dry-run OK |
+| `1` | OpenStack / operational failure |
+| `2` | Usage / non-interactive misuse (missing project name or missing `--yes`) |
 
 Run any script with `--help` for all options.
