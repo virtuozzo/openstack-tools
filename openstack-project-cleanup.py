@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Delete common OpenStack resources from one project."""
+"""Delete common OpenStack resources from one project using openstacksdk."""
+
+from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 
 EXIT_OK = 0
@@ -27,8 +26,6 @@ DEFAULT_WAIT_INTERVAL = 5.0
 @dataclass(frozen=True)
 class ResourceKind:
     name: str
-    list_command: list[str]
-    delete_command: Callable[[str], list[str]]
     label_fields: tuple[str, ...]
     include_resource: Callable[[dict[str, object]], bool] = lambda _resource: True
     delete_identifier_fields: tuple[str, ...] = ("ID",)
@@ -109,7 +106,6 @@ def log_error(message: str, options: RuntimeOptions) -> None:
 def log_warning(message: str, options: RuntimeOptions) -> None:
     emit_github_annotation("warning", message, options)
     print(message, file=sys.stderr)
-
 
 
 class ProgressIndicator:
@@ -251,7 +247,9 @@ def network_is_cleanup_candidate(resource: dict[str, object]) -> bool:
 
 
 def is_router_owned_port(resource: dict[str, object]) -> bool:
-    return normalized_resource_value(resource, "Device Owner").startswith("network:router")
+    return normalized_resource_value(resource, "Device Owner").startswith(
+        "network:router"
+    )
 
 
 def is_compute_owned_port(resource: dict[str, object]) -> bool:
@@ -260,147 +258,55 @@ def is_compute_owned_port(resource: dict[str, object]) -> bool:
 
 SERVER_KIND = ResourceKind(
     name="servers",
-    list_command=[
-        "openstack",
-        "server",
-        "list",
-        "-f",
-        "json",
-        "-c",
-        "ID",
-        "-c",
-        "Name",
-    ],
-    delete_command=lambda resource_id: ["openstack", "server", "delete", resource_id],
     label_fields=("Name", "ID"),
 )
 
 PORT_KIND = ResourceKind(
     name="ports",
-    list_command=[
-        "openstack",
-        "port",
-        "list",
-        "--long",
-        "-f",
-        "json",
-        "-c",
-        "ID",
-        "-c",
-        "Name",
-        "-c",
-        "Fixed IP Addresses",
-        "-c",
-        "Device Owner",
-        "-c",
-        "Device ID",
-    ],
-    delete_command=lambda resource_id: ["openstack", "port", "delete", resource_id],
     label_fields=("Name", "ID", "Fixed IP Addresses", "Device Owner"),
 )
 
 ROUTER_KIND = ResourceKind(
     name="routers",
-    list_command=[
-        "openstack",
-        "router",
-        "list",
-        "-f",
-        "json",
-        "-c",
-        "ID",
-        "-c",
-        "Name",
-    ],
-    delete_command=lambda resource_id: ["openstack", "router", "delete", resource_id],
     label_fields=("Name", "ID"),
 )
 
 FLOATING_IP_KIND = ResourceKind(
     name="floating IPs",
-    list_command=[
-        "openstack",
-        "floating",
-        "ip",
-        "list",
-        "-f",
-        "json",
-        "-c",
-        "ID",
-        "-c",
-        "Floating IP Address",
-    ],
-    delete_command=lambda resource_id: [
-        "openstack",
-        "floating",
-        "ip",
-        "delete",
-        resource_id,
-    ],
     label_fields=("Floating IP Address", "ID"),
 )
 
 VOLUME_KIND = ResourceKind(
     name="volumes",
-    list_command=[
-        "openstack",
-        "volume",
-        "list",
-        "-f",
-        "json",
-        "-c",
-        "ID",
-        "-c",
-        "Name",
-        "-c",
-        "Status",
-    ],
-    delete_command=lambda resource_id: ["openstack", "volume", "delete", resource_id],
     label_fields=("Name", "ID", "Status"),
 )
 
 NETWORK_KIND = ResourceKind(
     name="networks",
-    list_command=[
-        "openstack",
-        "network",
-        "list",
-        "--long",
-        "-f",
-        "json",
-    ],
-    delete_command=lambda resource_id: ["openstack", "network", "delete", resource_id],
     label_fields=("Name", "ID", "Router Type", "Network Type", "Shared"),
     include_resource=lambda resource: network_is_cleanup_candidate(resource),
 )
 
 KEYPAIR_KIND = ResourceKind(
     name="keypairs",
-    list_command=[
-        "openstack",
-        "keypair",
-        "list",
-        "-f",
-        "json",
-        "-c",
-        "Name",
-    ],
-    delete_command=lambda resource_name: ["openstack", "keypair", "delete", resource_name],
     label_fields=("Name",),
-    include_resource=lambda resource: normalized_resource_value(resource, "Name") == "ssh_key",
+    include_resource=lambda resource: (
+        normalized_resource_value(resource, "Name") == "ssh_key"
+    ),
     delete_identifier_fields=("Name",),
 )
 
 
-def require_openstack_cli() -> bool:
-    if shutil.which("openstack"):
-        return True
-
-    print(
-        "Error: OpenStack CLI is required. Install python-openstackclient.",
-        file=sys.stderr,
-    )
-    return False
+def require_openstacksdk() -> bool:
+    try:
+        import openstack  # noqa: F401
+    except ImportError:
+        print(
+            "Error: openstacksdk is required. Install with: pip install openstacksdk",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def parse_args() -> argparse.Namespace:
@@ -461,7 +367,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_COMMAND_TIMEOUT,
         metavar="SECONDS",
         help=(
-            "Timeout for each openstack CLI call "
+            "Timeout for OpenStack API requests "
             f"(default: {DEFAULT_COMMAND_TIMEOUT})"
         ),
     )
@@ -503,67 +409,49 @@ def runtime_options_from_args(args: argparse.Namespace) -> RuntimeOptions:
     )
 
 
-def project_env(project_name: str) -> dict[str, str]:
-    env = os.environ.copy()
-    env["OS_PROJECT_NAME"] = project_name
-    env.pop("OS_PROJECT_ID", None)
-    return env
+def connect_project(project_name: str, options: RuntimeOptions) -> Any:
+    """Return an openstacksdk Connection scoped to project_name."""
+    import openstack
 
-
-def run_command(
-    command: list[str],
-    env: dict[str, str],
-    timeout: int = DEFAULT_COMMAND_TIMEOUT,
-) -> subprocess.CompletedProcess[str]:
+    saved_project_id = os.environ.get("OS_PROJECT_ID")
+    saved_project_name = os.environ.get("OS_PROJECT_NAME")
     try:
-        return subprocess.run(
-            command,
-            capture_output=True,
-            env=env,
-            text=True,
-            timeout=timeout,
+        os.environ["OS_PROJECT_NAME"] = project_name
+        os.environ.pop("OS_PROJECT_ID", None)
+        return openstack.connect(
+            cloud="envvars",
+            project_name=project_name,
+            timeout=options.command_timeout,
         )
-    except subprocess.TimeoutExpired as e:
-        cmd_name = " ".join(command[:3]) if command else "command"
-        raise CleanupError(
-            f"Timed out after {timeout}s running: {cmd_name}"
-        ) from e
+    except Exception as e:
+        raise CleanupError(f"Failed to connect to OpenStack: {e}") from e
+    finally:
+        if saved_project_id is not None:
+            os.environ["OS_PROJECT_ID"] = saved_project_id
+        else:
+            os.environ.pop("OS_PROJECT_ID", None)
+        if saved_project_name is not None:
+            os.environ["OS_PROJECT_NAME"] = saved_project_name
+        else:
+            os.environ.pop("OS_PROJECT_NAME", None)
 
 
-def command_output_or_raise(
-    command: list[str],
-    env: dict[str, str],
-    failure_message: str,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT,
-) -> str:
-    result = run_command(command, env, timeout=timeout)
-    output = (result.stdout + result.stderr).strip()
-    if result.returncode != 0:
-        message = f"{failure_message}\n{output}" if output else failure_message
-        raise CleanupError(message)
-    return result.stdout
+def is_not_found(exc: BaseException) -> bool:
+    from openstack import exceptions as sdk_exc
+
+    if isinstance(exc, (sdk_exc.NotFoundException, sdk_exc.ResourceNotFound)):
+        return True
+    message = str(exc).casefold()
+    return "could not be found" in message or "not found" in message
 
 
-def list_resources(
-    kind: ResourceKind,
-    env: dict[str, str],
-    timeout: int = DEFAULT_COMMAND_TIMEOUT,
-) -> list[dict[str, object]]:
-    output = command_output_or_raise(
-        kind.list_command,
-        env,
-        f"Failed to list {kind.name}.",
-        timeout=timeout,
-    )
-    try:
-        resources = json.loads(output)
-    except json.JSONDecodeError as e:
-        raise CleanupError(f"Failed to parse {kind.name} list output: {e}") from e
+def exception_message(exc: BaseException) -> str:
+    return str(exc).strip() or exc.__class__.__name__
 
-    if not isinstance(resources, list):
-        raise CleanupError(f"Unexpected {kind.name} list output.")
 
-    return [resource for resource in resources if isinstance(resource, dict)]
+def confirm(prompt: str) -> bool:
+    choice = input(f"{prompt} y/n: ")
+    return choice.lower().startswith("y")
 
 
 def resource_id(resource: dict[str, object]) -> str:
@@ -668,246 +556,131 @@ def print_openstack_table(headers: list[str], rows: list[list[str]]) -> None:
     print(border())
 
 
-def confirm(prompt: str) -> bool:
-    choice = input(f"{prompt} y/n: ")
-    return choice.lower().startswith("y")
+def sdk_to_server(server: Any) -> dict[str, object]:
+    return {"ID": server.id, "Name": getattr(server, "name", None) or ""}
 
 
-def already_gone_error(kind: ResourceKind, output: str) -> bool:
-    if kind.name != "ports":
-        return False
-    normalized = output.casefold()
-    return "no port found" in normalized or "could not be found" in normalized
-
-
-def delete_resource(
-    kind: ResourceKind,
-    resource: dict[str, object],
-    env: dict[str, str],
-    options: RuntimeOptions,
-) -> bool:
-    identifier = resource_delete_identifier(kind, resource)
-    if not identifier:
-        log_error(
-            f"Skipping {kind.name} item without a delete identifier: {resource}",
-            options,
-        )
-        if options.fail_fast:
-            raise FailFastError(
-                f"Missing delete identifier for {kind.name}"
-            )
-        return False
-
-    label = resource_label(kind, resource)
-    log_info(f"Deleting {kind.name}: {label}...", options)
-    result = run_command(
-        kind.delete_command(identifier),
-        env,
-        timeout=options.command_timeout,
-    )
-    output = (result.stdout + result.stderr).strip()
-
-    if result.returncode == 0:
-        if output:
-            log_info(output, options)
-        log_info(f"Deleting {kind.name}: {label}... done.", options)
-        return True
-
-    if already_gone_error(kind, output):
-        log_info(f"Deleting {kind.name}: {label}... already gone.", options)
-        return True
-
-    message = f"Deleting {kind.name}: {label}... failed."
-    if output:
-        message = f"{message}\n{output}"
-    log_error(message, options)
-    if options.fail_fast:
-        raise FailFastError(message)
-    return False
-
-
-def run_openstack_action(
-    description: str,
-    command: list[str],
-    env: dict[str, str],
-    options: RuntimeOptions,
-    ignore_failure_patterns: tuple[str, ...] = (),
-) -> bool:
-    log_info(f"{description}...", options)
-    result = run_command(command, env, timeout=options.command_timeout)
-    output = (result.stdout + result.stderr).strip()
-
-    if result.returncode == 0:
-        if output:
-            log_info(output, options)
-        log_info(f"{description}... done.", options)
-        return True
-
-    output_normalized = output.casefold()
-    if any(pattern.casefold() in output_normalized for pattern in ignore_failure_patterns):
-        if output:
-            log_info(output, options)
-        log_info(f"{description}... skipped.", options)
-        return True
-
-    message = f"{description}... failed."
-    if output:
-        message = f"{message}\n{output}"
-    log_error(message, options)
-    if options.fail_fast:
-        raise FailFastError(message)
-    return False
-
-
-# Router cleanup needs Neutron router operations instead of generic port deletion.
-def router_ports(
-    router_id: str,
-    env: dict[str, str],
-    timeout: int = DEFAULT_COMMAND_TIMEOUT,
-) -> list[dict[str, object]]:
-    output = command_output_or_raise(
-        [
-            "openstack",
-            "port",
-            "list",
-            "--router",
-            router_id,
-            "-f",
-            "json",
-            "-c",
-            "ID",
-            "-c",
-            "Name",
-            "-c",
-            "Fixed IP Addresses",
-            "-c",
-            "Device Owner",
-        ],
-        env,
-        f"Failed to list ports for router {router_id}.",
-        timeout=timeout,
-    )
-    try:
-        ports = json.loads(output)
-    except json.JSONDecodeError as e:
-        raise CleanupError(f"Failed to parse router port list output: {e}") from e
-
-    if not isinstance(ports, list):
-        raise CleanupError("Unexpected router port list output.")
-
-    return [port for port in ports if isinstance(port, dict)]
-
-
-def fixed_ip_subnet_ids(port: dict[str, object]) -> list[str]:
-    fixed_ips = resource_value(port, "Fixed IP Addresses")
-    if isinstance(fixed_ips, list):
-        return [
-            str(item.get("subnet_id") or "").strip()
-            for item in fixed_ips
-            if isinstance(item, dict) and str(item.get("subnet_id") or "").strip()
-        ]
-
-    if isinstance(fixed_ips, str):
-        matches = re.findall(
-            r"'subnet_id': '([^']+)'|\"subnet_id\": \"([^\"]+)\"",
-            fixed_ips,
-        )
-        return [value for match in matches for value in match if value]
-
-    return []
-
-
-def remove_router_port(
-    router_id: str,
-    port: dict[str, object],
-    env: dict[str, str],
-    options: RuntimeOptions,
-) -> bool:
-    port_id = resource_id(port)
-    if not port_id:
-        log_error(f"Skipping router port without an ID: {port}", options)
-        if options.fail_fast:
-            raise FailFastError(f"Router port missing ID on router {router_id}")
-        return False
-
-    label = resource_label(PORT_KIND, port)
-    subnet_ids = fixed_ip_subnet_ids(port)
-    for subnet_id in subnet_ids:
-        if run_openstack_action(
-            f"Removing subnet {subnet_id} from router {router_id}",
-            ["openstack", "router", "remove", "subnet", router_id, subnet_id],
-            env,
-            options,
-        ):
-            return True
-
-    return run_openstack_action(
-        f"Removing port {label} from router {router_id}",
-        ["openstack", "router", "remove", "port", router_id, port_id],
-        env,
-        options,
-    )
-
-
-def cleanup_router(
-    router: dict[str, object],
-    env: dict[str, str],
-    options: RuntimeOptions,
-) -> bool:
-    router_id = resource_id(router)
-    if not router_id:
-        log_error(f"Skipping router without an ID: {router}", options)
-        if options.fail_fast:
-            raise FailFastError("Router missing ID")
-        return False
-
-    label = resource_label(ROUTER_KIND, router)
-    ok = run_openstack_action(
-        f"Unsetting external gateway for router {label}",
-        ["openstack", "router", "unset", "--external-gateway", router_id],
-        env,
-        options,
-        ignore_failure_patterns=(
-            "no external gateway",
-            "not currently set",
-            "gateway is not set",
-        ),
-    )
-
-    for port in router_ports(router_id, env, timeout=options.command_timeout):
-        ok = remove_router_port(router_id, port, env, options) and ok
-
-    return run_openstack_action(
-        f"Deleting routers: {label}",
-        ["openstack", "router", "delete", router_id],
-        env,
-        options,
-    ) and ok
-
-
-def kind_display_name(kind: ResourceKind) -> str:
-    return kind.name[:1].upper() + kind.name[1:]
-
-
-def gathering_message(kind: ResourceKind) -> str:
-    labels = {
-        "servers": "Gathering VM list...",
-        "volumes": "Gathering volume list...",
-        "floating IPs": "Gathering floating IP list...",
-        "routers": "Gathering router list...",
-        "ports": "Gathering port list...",
-        "networks": "Gathering network list...",
-        "keypairs": "Gathering keypair list...",
+def sdk_to_volume(volume: Any) -> dict[str, object]:
+    return {
+        "ID": volume.id,
+        "Name": getattr(volume, "name", None) or "",
+        "Status": getattr(volume, "status", None) or "",
     }
-    return labels.get(kind.name, f"Gathering {kind.name}...")
 
 
-def filter_resources(
-    kind: ResourceKind,
-    env: dict[str, str],
-    timeout: int = DEFAULT_COMMAND_TIMEOUT,
-) -> ResourceGroup:
-    all_resources = list_resources(kind, env, timeout=timeout)
+def sdk_to_floating_ip(floating_ip: Any) -> dict[str, object]:
+    return {
+        "ID": floating_ip.id,
+        "Floating IP Address": (
+            getattr(floating_ip, "floating_ip_address", None) or ""
+        ),
+    }
+
+
+def sdk_to_router(router: Any) -> dict[str, object]:
+    return {"ID": router.id, "Name": getattr(router, "name", None) or ""}
+
+
+def sdk_to_port(port: Any) -> dict[str, object]:
+    return {
+        "ID": port.id,
+        "Name": getattr(port, "name", None) or "",
+        "Fixed IP Addresses": getattr(port, "fixed_ips", None) or [],
+        "Device Owner": getattr(port, "device_owner", None) or "",
+        "Device ID": getattr(port, "device_id", None) or "",
+    }
+
+
+def sdk_to_network(network: Any) -> dict[str, object]:
+    provider_type = getattr(network, "provider_network_type", None) or ""
+    is_external = bool(getattr(network, "is_router_external", False))
+    is_shared = bool(getattr(network, "is_shared", False))
+    return {
+        "ID": network.id,
+        "Name": getattr(network, "name", None) or "",
+        "Network Type": provider_type,
+        "Provider Network Type": provider_type,
+        "provider:network_type": provider_type,
+        "Router Type": is_external,
+        "router:external": is_external,
+        "Shared": is_shared,
+        "shared": is_shared,
+    }
+
+
+def sdk_to_keypair(keypair: Any) -> dict[str, object]:
+    return {"Name": getattr(keypair, "name", None) or ""}
+
+
+def list_servers(conn: Any) -> list[dict[str, object]]:
+    try:
+        return [sdk_to_server(server) for server in conn.compute.servers()]
+    except Exception as e:
+        raise CleanupError(f"Failed to list servers.\n{exception_message(e)}") from e
+
+
+def list_volumes(conn: Any) -> list[dict[str, object]]:
+    try:
+        return [sdk_to_volume(volume) for volume in conn.block_storage.volumes()]
+    except Exception as e:
+        raise CleanupError(f"Failed to list volumes.\n{exception_message(e)}") from e
+
+
+def list_floating_ips(conn: Any) -> list[dict[str, object]]:
+    try:
+        return [sdk_to_floating_ip(ip) for ip in conn.network.ips()]
+    except Exception as e:
+        raise CleanupError(
+            f"Failed to list floating IPs.\n{exception_message(e)}"
+        ) from e
+
+
+def list_routers(conn: Any) -> list[dict[str, object]]:
+    try:
+        return [sdk_to_router(router) for router in conn.network.routers()]
+    except Exception as e:
+        raise CleanupError(f"Failed to list routers.\n{exception_message(e)}") from e
+
+
+def list_ports(conn: Any) -> list[dict[str, object]]:
+    try:
+        return [sdk_to_port(port) for port in conn.network.ports()]
+    except Exception as e:
+        raise CleanupError(f"Failed to list ports.\n{exception_message(e)}") from e
+
+
+def list_networks(conn: Any) -> list[dict[str, object]]:
+    try:
+        return [sdk_to_network(network) for network in conn.network.networks()]
+    except Exception as e:
+        raise CleanupError(f"Failed to list networks.\n{exception_message(e)}") from e
+
+
+def list_keypairs(conn: Any) -> list[dict[str, object]]:
+    try:
+        return [sdk_to_keypair(keypair) for keypair in conn.compute.keypairs()]
+    except Exception as e:
+        raise CleanupError(f"Failed to list keypairs.\n{exception_message(e)}") from e
+
+
+LISTERS: dict[str, Callable[[Any], list[dict[str, object]]]] = {
+    "servers": list_servers,
+    "volumes": list_volumes,
+    "floating IPs": list_floating_ips,
+    "routers": list_routers,
+    "ports": list_ports,
+    "networks": list_networks,
+    "keypairs": list_keypairs,
+}
+
+
+def list_resources(kind: ResourceKind, conn: Any) -> list[dict[str, object]]:
+    lister = LISTERS[kind.name]
+    return lister(conn)
+
+
+def filter_resources(kind: ResourceKind, conn: Any) -> ResourceGroup:
+    all_resources = list_resources(kind, conn)
     to_delete = [
         resource for resource in all_resources if kind.include_resource(resource)
     ]
@@ -917,81 +690,54 @@ def filter_resources(
     return ResourceGroup(kind=kind, to_delete=to_delete, skipped=skipped)
 
 
-def server_volumes_attached(
-    server: dict[str, object],
-    env: dict[str, str],
-    timeout: int = DEFAULT_COMMAND_TIMEOUT,
-) -> list[dict[str, object]]:
-    server_id = resource_id(server)
-    server_name = str(resource_value(server, "Name") or server_id).strip()
-    output = command_output_or_raise(
-        [
-            "openstack",
-            "server",
-            "show",
-            server_id,
-            "-f",
-            "json",
-            "-c",
-            "volumes_attached",
-        ],
-        env,
-        f"Failed to get volumes for server {server_name}.",
-        timeout=timeout,
-    )
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError as e:
-        raise CleanupError(
-            f"Failed to parse volumes for server {server_name}: {e}"
-        ) from e
-
-    if isinstance(payload, list):
-        if not payload:
-            return []
-        payload = payload[0]
-
-    if not isinstance(payload, dict):
-        return []
-
-    attached = resource_value(payload, "volumes_attached")
-    if not isinstance(attached, list):
-        return []
-
-    return [item for item in attached if isinstance(item, dict)]
-
-
-def attachment_volume_id(attachment: dict[str, object]) -> str:
-    for field in ("id", "volume_id"):
-        value = attachment.get(field)
+def attachment_volume_id(attachment: Any) -> str:
+    for attr in ("volume_id", "id"):
+        value = getattr(attachment, attr, None)
         if value:
             return str(value).strip()
+    if isinstance(attachment, dict):
+        for key in ("volume_id", "id"):
+            value = attachment.get(key)
+            if value:
+                return str(value).strip()
     return ""
 
 
-def attachment_delete_on_termination(attachment: dict[str, object]) -> bool:
-    for key, value in attachment.items():
-        if normalized_field_name(str(key)) == "deleteontermination":
-            return is_true_value(value)
+def attachment_delete_on_termination(attachment: Any) -> bool:
+    if hasattr(attachment, "delete_on_termination"):
+        return is_true_value(getattr(attachment, "delete_on_termination"))
+    if isinstance(attachment, dict):
+        for key, value in attachment.items():
+            if normalized_field_name(str(key)) == "deleteontermination":
+                return is_true_value(value)
     return False
 
 
 def volumes_deleted_with_servers(
     servers: list[dict[str, object]],
-    env: dict[str, str],
+    conn: Any,
     indicator: ProgressIndicator | None = None,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT,
 ) -> dict[str, str]:
     """Map volume ID to server name for volumes with delete_on_termination=True."""
     auto_delete: dict[str, str] = {}
     total = len(servers)
     for index, server in enumerate(servers, start=1):
-        server_name = str(resource_value(server, "Name") or resource_id(server)).strip()
+        server_id = resource_id(server)
+        server_name = str(
+            resource_value(server, "Name") or server_id
+        ).strip()
         if indicator and total:
             indicator.update(
                 f"Checking VM volumes ({index}/{total}): {server_name}..."
             )
-        for attachment in server_volumes_attached(server, env, timeout=timeout):
+        try:
+            attachments = list(conn.compute.volume_attachments(server_id))
+        except Exception as e:
+            raise CleanupError(
+                f"Failed to get volumes for server {server_name}.\n"
+                f"{exception_message(e)}"
+            ) from e
+        for attachment in attachments:
             volume_id = attachment_volume_id(attachment)
             if volume_id and attachment_delete_on_termination(attachment):
                 auto_delete[volume_id] = server_name
@@ -1000,16 +746,13 @@ def volumes_deleted_with_servers(
 
 def filter_volume_resources(
     servers: list[dict[str, object]],
-    env: dict[str, str],
+    conn: Any,
     indicator: ProgressIndicator | None = None,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT,
 ) -> ResourceGroup:
     if indicator:
         indicator.update(gathering_message(VOLUME_KIND))
-    all_volumes = list_resources(VOLUME_KIND, env, timeout=timeout)
-    auto_delete = volumes_deleted_with_servers(
-        servers, env, indicator, timeout=timeout
-    )
+    all_volumes = list_volumes(conn)
+    auto_delete = volumes_deleted_with_servers(servers, conn, indicator)
 
     to_delete: list[dict[str, object]] = []
     skipped: list[dict[str, object]] = []
@@ -1017,7 +760,9 @@ def filter_volume_resources(
         volume_id = resource_id(volume)
         server_name = auto_delete.get(volume_id)
         if server_name:
-            skipped.append({**volume, "_skip_reason": f"deleted with server {server_name}"})
+            skipped.append(
+                {**volume, "_skip_reason": f"deleted with server {server_name}"}
+            )
         else:
             to_delete.append(volume)
 
@@ -1026,13 +771,14 @@ def filter_volume_resources(
 
 def filter_port_resources(
     servers: list[dict[str, object]],
-    env: dict[str, str],
-    timeout: int = DEFAULT_COMMAND_TIMEOUT,
+    conn: Any,
 ) -> ResourceGroup:
-    all_ports = list_resources(PORT_KIND, env, timeout=timeout)
+    all_ports = list_ports(conn)
     server_ids = {resource_id(server) for server in servers if resource_id(server)}
     server_names = {
-        resource_id(server): str(resource_value(server, "Name") or resource_id(server)).strip()
+        resource_id(server): str(
+            resource_value(server, "Name") or resource_id(server)
+        ).strip()
         for server in servers
         if resource_id(server)
     }
@@ -1059,42 +805,373 @@ def filter_port_resources(
     return ResourceGroup(kind=PORT_KIND, to_delete=to_delete, skipped=skipped)
 
 
-def collect_cleanup_plan(
-    env: dict[str, str],
-    options: RuntimeOptions,
-) -> list[ResourceGroup]:
-    timeout = options.command_timeout
-    with progress(gathering_message(SERVER_KIND)) as indicator:
-        servers = filter_resources(SERVER_KIND, env, timeout=timeout)
+def kind_display_name(kind: ResourceKind) -> str:
+    return kind.name[:1].upper() + kind.name[1:]
+
+
+def gathering_message(kind: ResourceKind) -> str:
+    labels = {
+        "servers": "Gathering VM list...",
+        "volumes": "Gathering volume list...",
+        "floating IPs": "Gathering floating IP list...",
+        "routers": "Gathering router list...",
+        "ports": "Gathering port list...",
+        "networks": "Gathering network list...",
+        "keypairs": "Gathering keypair list...",
+    }
+    return labels.get(kind.name, f"Gathering {kind.name}...")
+
+
+def collect_cleanup_plan(conn: Any, _options: RuntimeOptions) -> list[ResourceGroup]:
+    with progress(gathering_message(SERVER_KIND)):
+        servers = filter_resources(SERVER_KIND, conn)
 
     with progress(gathering_message(VOLUME_KIND)) as indicator:
-        volumes = filter_volume_resources(
-            servers.to_delete, env, indicator, timeout=timeout
-        )
+        volumes = filter_volume_resources(servers.to_delete, conn, indicator)
 
     plan: list[ResourceGroup] = [servers, volumes]
-    for kind in (
-        FLOATING_IP_KIND,
-        ROUTER_KIND,
-    ):
+    for kind in (FLOATING_IP_KIND, ROUTER_KIND):
         with progress(gathering_message(kind)):
-            plan.append(filter_resources(kind, env, timeout=timeout))
+            plan.append(filter_resources(kind, conn))
 
     with progress(gathering_message(PORT_KIND)):
-        plan.append(
-            filter_port_resources(servers.to_delete, env, timeout=timeout)
-        )
+        plan.append(filter_port_resources(servers.to_delete, conn))
 
-    for kind in (
-        NETWORK_KIND,
-        KEYPAIR_KIND,
-    ):
+    for kind in (NETWORK_KIND, KEYPAIR_KIND):
         with progress(gathering_message(kind)):
-            plan.append(filter_resources(kind, env, timeout=timeout))
+            plan.append(filter_resources(kind, conn))
     return plan
 
 
-def resource_name_and_id(kind: ResourceKind, resource: dict[str, object]) -> tuple[str, str]:
+def delete_server(conn: Any, resource: dict[str, object]) -> None:
+    conn.compute.delete_server(resource_id(resource), ignore_missing=True)
+
+
+def delete_volume(conn: Any, resource: dict[str, object]) -> None:
+    conn.block_storage.delete_volume(resource_id(resource), ignore_missing=True)
+
+
+def delete_floating_ip(conn: Any, resource: dict[str, object]) -> None:
+    conn.network.delete_ip(resource_id(resource), ignore_missing=True)
+
+
+def delete_port(conn: Any, resource: dict[str, object]) -> None:
+    conn.network.delete_port(resource_id(resource), ignore_missing=True)
+
+
+def delete_network(conn: Any, resource: dict[str, object]) -> None:
+    conn.network.delete_network(resource_id(resource), ignore_missing=True)
+
+
+def delete_keypair(conn: Any, resource: dict[str, object]) -> None:
+    name = str(resource_value(resource, "Name") or "").strip()
+    conn.compute.delete_keypair(name, ignore_missing=True)
+
+
+DELETERS: dict[str, Callable[[Any, dict[str, object]], None]] = {
+    "servers": delete_server,
+    "volumes": delete_volume,
+    "floating IPs": delete_floating_ip,
+    "ports": delete_port,
+    "networks": delete_network,
+    "keypairs": delete_keypair,
+}
+
+
+def delete_resource(
+    kind: ResourceKind,
+    resource: dict[str, object],
+    conn: Any,
+    options: RuntimeOptions,
+) -> bool:
+    identifier = resource_delete_identifier(kind, resource)
+    if not identifier:
+        log_error(
+            f"Skipping {kind.name} item without a delete identifier: {resource}",
+            options,
+        )
+        if options.fail_fast:
+            raise FailFastError(f"Missing delete identifier for {kind.name}")
+        return False
+
+    label = resource_label(kind, resource)
+    log_info(f"Deleting {kind.name}: {label}...", options)
+    deleter = DELETERS.get(kind.name)
+    if deleter is None:
+        message = f"No SDK delete handler for {kind.name}"
+        log_error(message, options)
+        if options.fail_fast:
+            raise FailFastError(message)
+        return False
+
+    try:
+        deleter(conn, resource)
+    except Exception as e:
+        if is_not_found(e):
+            log_info(f"Deleting {kind.name}: {label}... already gone.", options)
+            return True
+        message = f"Deleting {kind.name}: {label}... failed.\n{exception_message(e)}"
+        log_error(message, options)
+        if options.fail_fast:
+            raise FailFastError(message) from e
+        return False
+
+    log_info(f"Deleting {kind.name}: {label}... done.", options)
+    return True
+
+
+def run_sdk_action(
+    description: str,
+    action: Callable[[], None],
+    options: RuntimeOptions,
+    ignore_patterns: tuple[str, ...] = (),
+) -> bool:
+    log_info(f"{description}...", options)
+    try:
+        action()
+    except Exception as e:
+        message = exception_message(e)
+        if is_not_found(e):
+            log_info(f"{description}... already gone.", options)
+            return True
+        if any(pattern.casefold() in message.casefold() for pattern in ignore_patterns):
+            log_info(f"{description}... skipped.", options)
+            return True
+        full = f"{description}... failed.\n{message}"
+        log_error(full, options)
+        if options.fail_fast:
+            raise FailFastError(full) from e
+        return False
+
+    log_info(f"{description}... done.", options)
+    return True
+
+
+def router_ports(conn: Any, router_id: str) -> list[dict[str, object]]:
+    try:
+        return [
+            sdk_to_port(port)
+            for port in conn.network.ports(device_id=router_id)
+        ]
+    except Exception as e:
+        raise CleanupError(
+            f"Failed to list ports for router {router_id}.\n{exception_message(e)}"
+        ) from e
+
+
+def fixed_ip_subnet_ids(port: dict[str, object]) -> list[str]:
+    fixed_ips = resource_value(port, "Fixed IP Addresses")
+    if isinstance(fixed_ips, list):
+        return [
+            str(item.get("subnet_id") or "").strip()
+            for item in fixed_ips
+            if isinstance(item, dict) and str(item.get("subnet_id") or "").strip()
+        ]
+
+    if isinstance(fixed_ips, str):
+        matches = re.findall(
+            r"'subnet_id': '([^']+)'|\"subnet_id\": \"([^\"]+)\"",
+            fixed_ips,
+        )
+        return [value for match in matches for value in match if value]
+
+    return []
+
+
+def remove_router_port(
+    conn: Any,
+    router_id: str,
+    port: dict[str, object],
+    options: RuntimeOptions,
+) -> bool:
+    port_id = resource_id(port)
+    if not port_id:
+        log_error(f"Skipping router port without an ID: {port}", options)
+        if options.fail_fast:
+            raise FailFastError(f"Router port missing ID on router {router_id}")
+        return False
+
+    label = resource_label(PORT_KIND, port)
+    subnet_ids = fixed_ip_subnet_ids(port)
+    for subnet_id in subnet_ids:
+        if run_sdk_action(
+            f"Removing subnet {subnet_id} from router {router_id}",
+            lambda sid=subnet_id: conn.network.remove_interface_from_router(
+                router_id, subnet=sid
+            ),
+            options,
+        ):
+            return True
+
+    return run_sdk_action(
+        f"Removing port {label} from router {router_id}",
+        lambda: conn.network.remove_interface_from_router(router_id, port=port_id),
+        options,
+    )
+
+
+def cleanup_router(
+    conn: Any,
+    router: dict[str, object],
+    options: RuntimeOptions,
+) -> bool:
+    router_id = resource_id(router)
+    if not router_id:
+        log_error(f"Skipping router without an ID: {router}", options)
+        if options.fail_fast:
+            raise FailFastError("Router missing ID")
+        return False
+
+    label = resource_label(ROUTER_KIND, router)
+    ok = run_sdk_action(
+        f"Unsetting external gateway for router {label}",
+        lambda: conn.network.remove_gateway_from_router(router_id),
+        options,
+        ignore_patterns=(
+            "no external gateway",
+            "not currently set",
+            "gateway is not set",
+            "external_gateway_info",
+        ),
+    )
+
+    for port in router_ports(conn, router_id):
+        ok = remove_router_port(conn, router_id, port, options) and ok
+
+    return (
+        run_sdk_action(
+            f"Deleting routers: {label}",
+            lambda: conn.network.delete_router(router_id, ignore_missing=True),
+            options,
+        )
+        and ok
+    )
+
+
+def wait_for_deleted_resources(
+    kind: ResourceKind,
+    resources: list[dict[str, object]],
+    conn: Any,
+    options: RuntimeOptions,
+) -> None:
+    if not options.wait or not resources:
+        return
+
+    for resource in resources:
+        identifier = resource_delete_identifier(kind, resource)
+        if not identifier:
+            continue
+        label = resource_label(kind, resource)
+        singular = kind.name.rstrip("s")
+        log_info(
+            f"Waiting for {singular} {label} to disappear "
+            f"(timeout {options.wait_timeout}s)...",
+            options,
+        )
+        try:
+            if kind.name == "servers":
+                server = conn.compute.get_server(identifier)
+                if server is None:
+                    log_info(f"Waiting for {singular} {label}... gone.", options)
+                    continue
+                conn.compute.wait_for_delete(
+                    server,
+                    wait=options.wait_timeout,
+                    interval=options.wait_interval,
+                )
+            elif kind.name == "volumes":
+                volume = conn.block_storage.get_volume(identifier)
+                if volume is None:
+                    log_info(f"Waiting for {singular} {label}... gone.", options)
+                    continue
+                conn.block_storage.wait_for_delete(
+                    volume,
+                    wait=options.wait_timeout,
+                    interval=options.wait_interval,
+                )
+            else:
+                continue
+        except Exception as e:
+            if is_not_found(e):
+                log_info(f"Waiting for {singular} {label}... gone.", options)
+                continue
+            from openstack import exceptions as sdk_exc
+
+            if isinstance(e, sdk_exc.ResourceTimeout):
+                raise CleanupError(
+                    f"Timed out after {options.wait_timeout}s waiting for "
+                    f"{singular} {label} to disappear"
+                ) from e
+            raise CleanupError(
+                f"Failed while waiting for {singular} {label} to disappear.\n"
+                f"{exception_message(e)}"
+            ) from e
+
+        log_info(f"Waiting for {singular} {label}... gone.", options)
+
+
+def delete_routers(
+    routers: list[dict[str, object]],
+    conn: Any,
+    options: RuntimeOptions,
+) -> int:
+    failures = 0
+    for router in routers:
+        try:
+            ok = cleanup_router(conn, router, options)
+        except FailFastError:
+            raise
+        except CleanupError as e:
+            log_error(str(e), options)
+            ok = False
+        if not ok:
+            failures += 1
+            if options.fail_fast:
+                raise FailFastError("Router deletion failed")
+    return failures
+
+
+def delete_kind_resources(
+    group: ResourceGroup,
+    conn: Any,
+    options: RuntimeOptions,
+) -> tuple[int, list[dict[str, object]]]:
+    failures = 0
+    deleted: list[dict[str, object]] = []
+    for resource in group.to_delete:
+        if delete_resource(group.kind, resource, conn, options):
+            deleted.append(resource)
+        else:
+            failures += 1
+    return failures, deleted
+
+
+def execute_cleanup_plan(
+    plan: list[ResourceGroup],
+    conn: Any,
+    options: RuntimeOptions,
+) -> int:
+    failures = 0
+    for group in plan:
+        if not group.to_delete:
+            continue
+        print()
+        print(f"Deleting {kind_display_name(group.kind)}...")
+        if group.kind.name == "routers":
+            failures += delete_routers(group.to_delete, conn, options)
+            deleted: list[dict[str, object]] = []
+        else:
+            kind_failures, deleted = delete_kind_resources(group, conn, options)
+            failures += kind_failures
+
+        if group.kind.name in {"servers", "volumes"}:
+            wait_for_deleted_resources(group.kind, deleted, conn, options)
+    return failures
+
+
+def resource_name_and_id(
+    kind: ResourceKind, resource: dict[str, object]
+) -> tuple[str, str]:
     if kind.name == "floating IPs":
         name = format_field_value(
             "Floating IP Address",
@@ -1158,7 +1235,6 @@ def build_plan_rows(plan: list[ResourceGroup]) -> tuple[list[list[str]], int]:
             )
 
         for resource in group.skipped:
-            # Router-owned ports are internal bookkeeping; keep the table focused.
             if group.kind.name == "ports" and str(
                 resource.get("_skip_reason", "")
             ) == "router-owned":
@@ -1219,7 +1295,13 @@ def write_github_step_summary(
     ]
     if failures is not None:
         lines.append(f"- Deletion failures: **{failures}**")
-    lines.extend(["", "| Type | Name | ID | Details | Action |", "| --- | --- | --- | --- | --- |"])
+    lines.extend(
+        [
+            "",
+            "| Type | Name | ID | Details | Action |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
     if not rows:
         lines.append("| — | — | — | — | none |")
     else:
@@ -1230,164 +1312,6 @@ def write_github_step_summary(
 
     with open(summary_path, "a", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
-
-
-def resource_not_found(output: str) -> bool:
-    normalized = output.casefold()
-    markers = (
-        "could not be found",
-        "no server with a name or id",
-        "no volume with a name or id",
-        "no volume found",
-        "no server found",
-        "not found",
-    )
-    return any(marker in normalized for marker in markers)
-
-
-def wait_until_gone(
-    kind: ResourceKind,
-    resource: dict[str, object],
-    show_command: list[str],
-    env: dict[str, str],
-    options: RuntimeOptions,
-) -> None:
-    identifier = resource_delete_identifier(kind, resource)
-    label = resource_label(kind, resource)
-    if not identifier:
-        return
-
-    singular = kind.name.rstrip("s")
-    deadline = time.monotonic() + options.wait_timeout
-    log_info(
-        f"Waiting for {singular} {label} to disappear "
-        f"(timeout {options.wait_timeout}s)...",
-        options,
-    )
-
-    while True:
-        result = run_command(
-            show_command,
-            env,
-            timeout=options.command_timeout,
-        )
-        output = (result.stdout + result.stderr).strip()
-        if result.returncode != 0 and resource_not_found(output):
-            log_info(f"Waiting for {singular} {label}... gone.", options)
-            return
-        if result.returncode != 0 and not resource_not_found(output):
-            message = (
-                f"Failed while waiting for {singular} {label} to disappear."
-            )
-            if output:
-                message = f"{message}\n{output}"
-            raise CleanupError(message)
-
-        if time.monotonic() >= deadline:
-            raise CleanupError(
-                f"Timed out after {options.wait_timeout}s waiting for "
-                f"{singular} {label} to disappear"
-            )
-        time.sleep(options.wait_interval)
-
-
-def wait_for_deleted_resources(
-    kind: ResourceKind,
-    resources: list[dict[str, object]],
-    env: dict[str, str],
-    options: RuntimeOptions,
-) -> None:
-    if not options.wait or not resources:
-        return
-
-    for resource in resources:
-        identifier = resource_delete_identifier(kind, resource)
-        if not identifier:
-            continue
-        if kind.name == "servers":
-            show_command = [
-                "openstack",
-                "server",
-                "show",
-                identifier,
-                "-f",
-                "value",
-                "-c",
-                "id",
-            ]
-        elif kind.name == "volumes":
-            show_command = [
-                "openstack",
-                "volume",
-                "show",
-                identifier,
-                "-f",
-                "value",
-                "-c",
-                "id",
-            ]
-        else:
-            continue
-        wait_until_gone(kind, resource, show_command, env, options)
-
-
-def delete_routers(
-    routers: list[dict[str, object]],
-    env: dict[str, str],
-    options: RuntimeOptions,
-) -> int:
-    failures = 0
-    for router in routers:
-        try:
-            ok = cleanup_router(router, env, options)
-        except FailFastError:
-            raise
-        except CleanupError as e:
-            log_error(str(e), options)
-            ok = False
-        if not ok:
-            failures += 1
-            if options.fail_fast:
-                raise FailFastError("Router deletion failed")
-    return failures
-
-
-def delete_kind_resources(
-    group: ResourceGroup,
-    env: dict[str, str],
-    options: RuntimeOptions,
-) -> tuple[int, list[dict[str, object]]]:
-    failures = 0
-    deleted: list[dict[str, object]] = []
-    for resource in group.to_delete:
-        if delete_resource(group.kind, resource, env, options):
-            deleted.append(resource)
-        else:
-            failures += 1
-    return failures, deleted
-
-
-def execute_cleanup_plan(
-    plan: list[ResourceGroup],
-    env: dict[str, str],
-    options: RuntimeOptions,
-) -> int:
-    failures = 0
-    for group in plan:
-        if not group.to_delete:
-            continue
-        print()
-        print(f"Deleting {kind_display_name(group.kind)}...")
-        if group.kind.name == "routers":
-            failures += delete_routers(group.to_delete, env, options)
-            deleted: list[dict[str, object]] = []
-        else:
-            kind_failures, deleted = delete_kind_resources(group, env, options)
-            failures += kind_failures
-
-        if group.kind.name in {"servers", "volumes"}:
-            wait_for_deleted_resources(group.kind, deleted, env, options)
-    return failures
 
 
 def get_project_name(project_name: str | None) -> str:
@@ -1411,7 +1335,7 @@ def main() -> int:
     args = parse_args()
     options = runtime_options_from_args(args)
 
-    if not require_openstack_cli():
+    if not require_openstacksdk():
         return EXIT_FAILURE
 
     try:
@@ -1427,8 +1351,6 @@ def main() -> int:
         )
         return EXIT_USAGE
 
-    env = project_env(project_name)
-
     print(f"Using OS_PROJECT_NAME={project_name}")
     print(
         "Deletion order: "
@@ -1436,7 +1358,8 @@ def main() -> int:
     )
 
     try:
-        plan = collect_cleanup_plan(env, options)
+        conn = connect_project(project_name, options)
+        plan = collect_cleanup_plan(conn, options)
     except CleanupError as e:
         log_error(str(e), options)
         return EXIT_FAILURE
@@ -1482,7 +1405,7 @@ def main() -> int:
         print(f"Deleting {total} resources (--yes)...")
 
     try:
-        failures = execute_cleanup_plan(plan, env, options)
+        failures = execute_cleanup_plan(plan, conn, options)
     except FailFastError as e:
         log_error(str(e), options)
         write_github_step_summary(

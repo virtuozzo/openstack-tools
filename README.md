@@ -6,8 +6,8 @@ Small helper scripts for OpenStack administration.
 
 - Python 3.10+
 - OpenStack credentials in the usual `OS_*` environment variables
-- `openstacksdk` for `openstack-domain-quota-usage.py`
-- OpenStack CLI for `openstack-image-share.py` and `openstack-project-cleanup.py`
+- `openstacksdk` for `openstack-domain-quota-usage.py` and `openstack-project-cleanup.py`
+- OpenStack CLI for `openstack-image-share.py`
 
 ```bash
 pip install -r requirements.txt
@@ -43,14 +43,14 @@ python3 openstack-image-share.py --add-image IMAGE_ID
 
 ## `openstack-project-cleanup.py`
 
-Lists all project resources to be cleaned up, then asks once before deleting them:
+Lists all project resources to be cleaned up, then asks once before deleting them. Uses `openstacksdk` (not the OpenStack CLI).
 
 - Deletes servers, volumes, floating IPs, routers, ports, networks, then the `ssh_key` keypair.
 - Skips volumes attached to VMs with `delete_on_termination=True` (removed when the VM is deleted).
 - Skips compute ports attached to VMs (removed when the VM is deleted).
 - Detaches router interfaces before deleting routers.
 - Skips networks named `public`; only internal, vxlan, non-shared networks are eligible.
-- With `--wait` (default in CI or with `--yes`), polls until deleted servers/volumes are gone before continuing.
+- With `--wait` (default in CI or with `--yes`), waits until deleted servers/volumes are gone before continuing.
 
 ```bash
 source openrc.sh
@@ -61,9 +61,10 @@ python3 openstack-project-cleanup.py --yes PROJECT_NAME
 
 ### GitHub Actions
 
-In CI / non-TTY environments the script never prompts. Pass the project name and either `--yes` or `--dry-run`. Standard `OS_*` credentials must be present in the job environment.
+In CI / non-TTY environments the script never prompts. Pass the project name and either `--yes` or `--dry-run`. Install `openstacksdk` and provide standard `OS_*` credentials in the job environment.
 
 ```bash
+pip install openstacksdk
 python3 openstack-project-cleanup.py --yes --wait --fail-fast --quiet PROJECT_NAME
 ```
 
@@ -71,7 +72,7 @@ Useful CI options:
 
 - `--wait` / `--no-wait` — wait for async server/volume deletes (default on in CI or with `--yes`)
 - `--wait-timeout` / `--wait-interval` — wait polling controls (defaults: 600s / 5s)
-- `--command-timeout` — per-CLI-call timeout (default: 120s)
+- `--command-timeout` — OpenStack API request timeout (default: 120s)
 - `--fail-fast` — abort on the first deletion failure
 - `--quiet` — keep the plan table and final summary; suppress per-resource chatter
 - `--github` — emit `::error::` / `::warning::` annotations and append a markdown table to `$GITHUB_STEP_SUMMARY` (on by default when `GITHUB_ACTIONS` is set)
